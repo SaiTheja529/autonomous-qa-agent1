@@ -1,0 +1,21 @@
+E-Shop Checkout UI/UX Guidelines
+
+Form and Validation
+- Validation errors must be shown inline directly under the relevant input in red text (#c62828).
+- Required fields should show a small helper note when left empty after a submit attempt.
+- The “Payment Successful!” confirmation should be green (#1b5e20) and bold for quick scanning.
+
+Buttons and Controls
+- Primary action buttons (“Add to Cart”, “Pay Now”) should be green with white text; hover state slightly darkens.
+- Disabled buttons should be gray with a not-allowed cursor.
+- Radio groups should include clear labels: Shipping (Standard, Express) and Payment (Credit Card, PayPal).
+
+Layout and Typography
+- Use a clean, single-column layout for the form beside the cart summary on desktop; stack on mobile.
+- Prefer a geometric sans font (e.g., “Montserrat”, “Nunito”) with at least 16px base size.
+- Inputs should have generous padding and a subtle border radius for friendliness.
+
+Messaging and Microcopy
+- Error messages should be concise (e.g., “Enter a valid email address.”).
+- Success messaging should reference the action (e.g., “Payment Successful!”).
+- Discount code feedback should specify whether the code was applied or invalid.

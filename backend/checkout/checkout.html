@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>E-Shop Checkout</title>
+  <style>
+    :root {
+      --primary: #0f766e;
+      --primary-dark: #0b5b55;
+      --accent: #0ea5e9;
+      --error: #c62828;
+      --border: #e2e8f0;
+      --bg: #f8fafc;
+      --text: #0f172a;
+      --muted: #6b7280;
+      --radius: 10px;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Space Grotesk", "Nunito", "Montserrat", system-ui, -apple-system, sans-serif;
+      background: radial-gradient(circle at 20% 20%, #e0f2fe 0, #ffffff 35%, #f8fafc 70%);
+      color: var(--text);
+    }
+    header {
+      position: relative;
+      overflow: hidden;
+      background: linear-gradient(120deg, rgba(14,165,233,0.12), rgba(16,185,129,0.12));
+      padding: 28px 24px 24px;
+      border-bottom: 1px solid var(--border);
+    }
+    header::after {
+      content: "";
+      position: absolute;
+      inset: -40px 40% auto -40px;
+      height: 180px;
+      background: radial-gradient(circle at 20% 20%, rgba(14,165,233,0.25), transparent 55%);
+      opacity: 0.5;
+    }
+    h1 { margin: 0 0 8px; font-size: 30px; letter-spacing: -0.5px; }
+    p { margin: 0; color: var(--muted); }
+
+    .page {
+      max-width: 1140px;
+      margin: 24px auto;
+      padding: 0 18px 36px;
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 18px;
+    }
+    @media (max-width: 960px) { .page { grid-template-columns: 1fr; } }
+
+    .card {
+      background: rgba(255,255,255,0.9);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px;
+      box-shadow: 0 18px 42px rgba(15, 23, 42, 0.06);
+      backdrop-filter: blur(6px);
+    }
+    .product-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 12px;
+    }
+    .product {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      background: linear-gradient(180deg, #f8fafc 0%, #ffffff 70%);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.6);
+    }
+    .product h3 { margin: 0; font-size: 18px; letter-spacing: -0.25px; }
+    .product .sku { color: var(--muted); font-size: 13px; }
+    .product button { margin-top: auto; }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(14,165,233,0.12);
+      color: #0369a1;
+      font-weight: 700;
+      font-size: 13px;
+    }
+
+    .btn {
+      background: linear-gradient(120deg, var(--primary) 0%, var(--accent) 100%);
+      border: none;
+      color: #fff;
+      padding: 10px 14px;
+      border-radius: var(--radius);
+      cursor: pointer;
+      transition: transform 0.12s ease, box-shadow 0.12s ease, filter 0.12s ease;
+      font-weight: 800;
+      letter-spacing: -0.2px;
+    }
+    .btn:hover { transform: translateY(-1px); filter: brightness(1.02); box-shadow: 0 12px 20px rgba(14,165,233,0.25); }
+    .btn.secondary {
+      background: #f8fafc;
+      color: var(--text);
+      border: 1px solid var(--border);
+      box-shadow: none;
+    }
+    .btn:disabled {
+      background: #cfd8dc;
+      cursor: not-allowed;
+      box-shadow: none;
+      transform: none;
+    }
+
+    form { display: flex; flex-direction: column; gap: 12px; }
+    label { font-weight: 700; margin-bottom: 4px; display: block; letter-spacing: -0.2px; }
+    input[type="text"], input[type="email"], input[type="number"] {
+      width: 100%;
+      padding: 11px 12px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      font-size: 15px;
+      background: #fff;
+      transition: border 0.12s ease, box-shadow 0.12s ease;
+    }
+    input:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(14,165,233,0.15);
+    }
+    .field { display: flex; flex-direction: column; gap: 6px; }
+    .radio-group { display: flex; gap: 16px; flex-wrap: wrap; }
+    .radio-group label { font-weight: 500; }
+    .helper { color: var(--muted); font-size: 13px; }
+    .error { color: var(--error); font-size: 13px; }
+    .success { color: var(--primary); font-weight: 800; }
+    .banner {
+      padding: 12px;
+      border-radius: var(--radius);
+      margin-bottom: 12px;
+      display: none;
+    }
+    .banner.success {
+      background: #ecfdf3;
+      color: #15803d;
+      border: 1px solid #bbf7d0;
+    }
+    .banner.error {
+      background: #ffebee;
+      color: var(--error);
+      border: 1px solid #ffcdd2;
+    }
+    table { width: 100%; border-collapse: collapse; border-radius: var(--radius); overflow: hidden; }
+    th, td { padding: 10px 8px; border-bottom: 1px solid var(--border); text-align: left; }
+    th { font-size: 13px; color: var(--muted); background: #f8fafc; }
+    .totals { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
+    .totals div { display: flex; justify-content: space-between; font-weight: 700; }
+    .empty { color: var(--muted); text-align: center; padding: 12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div style="display:flex; align-items:center; gap:14px; flex-wrap:wrap; position: relative; z-index: 1;">
+      <div class="pill">E-Shop Checkout</div>
+      <div class="pill" style="background: rgba(22,163,74,0.14); color:#166534;">SAVE15 = 15% off $50+</div>
+    </div>
+    <h1 style="position:relative; z-index:1; margin-top:10px;">Modern, calm checkout for your test flows</h1>
+    <p style="position:relative; z-index:1;">Add items, apply discounts, choose shipping/payment, and validate inline messages.</p>
+  </header>
+
+  <div class="page">
+    <section class="card">
+      <h2>Products</h2>
+      <div class="product-grid">
+        <div class="product" data-sku="ASTRO-H1" data-price="120">
+          <h3>Astro Headphones</h3>
+          <div class="sku">SKU: ASTRO-H1</div>
+          <div>$120.00</div>
+          <button class="btn add-to-cart" id="add-to-cart-astro">Add to Cart</button>
+        </div>
+        <div class="product" data-sku="NOVA-C1" data-price="25">
+          <h3>Nova Phone Case</h3>
+          <div class="sku">SKU: NOVA-C1</div>
+          <div>$25.00</div>
+          <button class="btn add-to-cart" id="add-to-cart-nova">Add to Cart</button>
+        </div>
+        <div class="product" data-sku="LUMA-C1" data-price="35">
+          <h3>Lumina Charger</h3>
+          <div class="sku">SKU: LUMA-C1</div>
+          <div>$35.00</div>
+          <button class="btn add-to-cart" id="add-to-cart-lumina">Add to Cart</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Your Details</h2>
+      <div id="success-banner" class="banner success">Payment Successful!</div>
+      <form id="checkout-form" novalidate>
+        <div class="field">
+          <label for="full-name">Full Name</label>
+          <input id="full-name" name="full-name" type="text" placeholder="Jane Doe" required>
+          <div id="error-name" class="error"></div>
+        </div>
+        <div class="field">
+          <label for="email">Email</label>
+          <input id="email" name="email" type="email" placeholder="jane@example.com" required>
+          <div class="helper">We will send the receipt to this email.</div>
+          <div id="error-email" class="error"></div>
+        </div>
+        <div class="field">
+          <label for="address">Address</label>
+          <input id="address" name="address" type="text" placeholder="123 Market St, City" required>
+          <div id="error-address" class="error"></div>
+        </div>
+
+        <div class="field">
+          <label>Shipping Method</label>
+          <div class="radio-group">
+            <label><input type="radio" name="shipping" id="shipping-standard" value="standard"> Standard (Free)</label>
+            <label><input type="radio" name="shipping" id="shipping-express" value="express"> Express ($10)</label>
+          </div>
+          <div id="error-shipping" class="error"></div>
+        </div>
+
+        <div class="field">
+          <label>Payment Method</label>
+          <div class="radio-group">
+            <label><input type="radio" name="payment" id="payment-card" value="card"> Credit Card</label>
+            <label><input type="radio" name="payment" id="payment-paypal" value="paypal"> PayPal</label>
+          </div>
+          <div id="error-payment" class="error"></div>
+        </div>
+
+        <div class="field">
+          <label for="discount-code">Discount Code</label>
+          <div style="display:flex; gap:8px;">
+            <input id="discount-code" name="discount-code" type="text" placeholder="SAVE15">
+            <button class="btn secondary" type="button" id="apply-discount">Apply</button>
+          </div>
+          <div id="discount-feedback" class="error"></div>
+        </div>
+
+        <button class="btn" type="button" id="pay-now">Pay Now</button>
+      </form>
+    </section>
+
+    <section class="card" style="grid-column: span 2;">
+      <h2>Cart Summary</h2>
+      <div id="cart-items"></div>
+      <div class="totals">
+        <div><span>Subtotal</span><span id="cart-subtotal">$0.00</span></div>
+        <div><span>Discount</span><span id="cart-discount">-$0.00</span></div>
+        <div><span>Shipping</span><span id="cart-shipping">$0.00</span></div>
+        <div><span>Total</span><span id="cart-total">$0.00</span></div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const cart = {};
+    let discountApplied = false;
+    const discountCode = "SAVE15";
+
+    const productData = {
+      "ASTRO-H1": { name: "Astro Headphones", price: 120 },
+      "NOVA-C1": { name: "Nova Phone Case", price: 25 },
+      "LUMA-C1": { name: "Lumina Charger", price: 35 }
+    };
+
+    const format = (value) => `$${value.toFixed(2)}`;
+    const isValidEmail = (value) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(value);
+
+    function renderCart() {
+      const container = document.getElementById("cart-items");
+      const items = Object.keys(cart);
+
+      if (!items.length) {
+        container.innerHTML = `<div class="empty">Your cart is empty. Add an item to start.</div>`;
+        document.getElementById("cart-subtotal").textContent = "$0.00";
+        document.getElementById("cart-discount").textContent = "-$0.00";
+        document.getElementById("cart-shipping").textContent = "$0.00";
+        document.getElementById("cart-total").textContent = "$0.00";
+        return;
+      }
+
+      const rows = items.map((sku) => {
+        const item = cart[sku];
+        const lineTotal = item.price * item.qty;
+        return `
+          <tr>
+            <td>${item.name}<div class="helper">${sku}</div></td>
+            <td>${format(item.price)}</td>
+            <td><input type="number" min="1" value="${item.qty}" data-sku="${sku}" class="qty-input" style="width:60px;"></td>
+            <td>${format(lineTotal)}</td>
+          </tr>
+        `;
+      }).join("");
+
+      container.innerHTML = `
+        <table>
+          <thead>
+            <tr><th>Item</th><th>Price</th><th>Qty</th><th>Line Total</th></tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      `;
+
+      document.querySelectorAll(".qty-input").forEach((input) => {
+        input.addEventListener("input", (e) => {
+          const sku = e.target.dataset.sku;
+          const val = Math.max(1, parseInt(e.target.value || "1", 10));
+          cart[sku].qty = val;
+          renderCart();
+        });
+      });
+
+      updateTotals();
+    }
+
+    function updateTotals() {
+      const items = Object.values(cart);
+      const subtotal = items.reduce((sum, item) => sum + item.price * item.qty, 0);
+      const shipping = document.querySelector("input[name='shipping']:checked")?.value === "express" ? 10 : 0;
+      let discount = 0;
+
+      if (discountApplied && subtotal >= 50) {
+        discount = subtotal * 0.15;
+        document.getElementById("discount-feedback").textContent = "SAVE15 applied (15% off).";
+        document.getElementById("discount-feedback").className = "helper";
+      } else if (discountApplied && subtotal < 50) {
+        document.getElementById("discount-feedback").textContent = "Subtotal must be at least $50 for SAVE15.";
+        document.getElementById("discount-feedback").className = "error";
+        discount = 0;
+      }
+
+      const total = subtotal - discount + shipping;
+      document.getElementById("cart-subtotal").textContent = format(subtotal);
+      document.getElementById("cart-discount").textContent = `-${format(discount)}`;
+      document.getElementById("cart-shipping").textContent = format(shipping);
+      document.getElementById("cart-total").textContent = format(total);
+    }
+
+    function resetErrors() {
+      ["error-name","error-email","error-address","error-shipping","error-payment"].forEach(id => {
+        document.getElementById(id).textContent = "";
+      });
+      document.getElementById("success-banner").style.display = "none";
+    }
+
+    function validateForm() {
+      resetErrors();
+      let valid = true;
+      const name = document.getElementById("full-name").value.trim();
+      const email = document.getElementById("email").value.trim();
+      const address = document.getElementById("address").value.trim();
+      const shipping = document.querySelector("input[name='shipping']:checked")?.value;
+      const payment = document.querySelector("input[name='payment']:checked")?.value;
+
+      if (!name) { document.getElementById("error-name").textContent = "Full name is required."; valid = false; }
+      if (!email || !isValidEmail(email)) {
+        document.getElementById("error-email").textContent = "Enter a valid email address.";
+        valid = false;
+      } else {
+        document.getElementById("error-email").textContent = "";
+      }
+      if (!address) { document.getElementById("error-address").textContent = "Address is required."; valid = false; }
+      if (!shipping) { document.getElementById("error-shipping").textContent = "Select a shipping method."; valid = false; }
+      if (!payment) { document.getElementById("error-payment").textContent = "Select a payment method."; valid = false; }
+      if (!Object.keys(cart).length) { alert("Add at least one item to cart."); valid = false; }
+      return { valid, shipping, payment };
+    }
+
+    function applyDiscount() {
+      const code = document.getElementById("discount-code").value.trim();
+      if (!code) {
+        document.getElementById("discount-feedback").textContent = "Enter a code to apply.";
+        document.getElementById("discount-feedback").className = "error";
+        discountApplied = false;
+        updateTotals();
+        return;
+      }
+      if (code.toLowerCase() === discountCode.toLowerCase()) {
+        discountApplied = true;
+        document.getElementById("discount-feedback").textContent = "SAVE15 applied (15% off).";
+        document.getElementById("discount-feedback").className = "helper";
+      } else {
+        discountApplied = false;
+        document.getElementById("discount-feedback").textContent = "Invalid or ineligible code.";
+        document.getElementById("discount-feedback").className = "error";
+      }
+      updateTotals();
+    }
+
+    document.querySelectorAll(".add-to-cart").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const parent = btn.closest(".product");
+        const sku = parent.dataset.sku;
+        const price = Number(parent.dataset.price);
+        if (!cart[sku]) {
+          cart[sku] = { sku, name: productData[sku].name, price, qty: 1 };
+        } else {
+          cart[sku].qty += 1;
+        }
+        renderCart();
+      });
+    });
+
+    document.getElementById("apply-discount").addEventListener("click", applyDiscount);
+    document.querySelectorAll("input[name='shipping']").forEach((radio) => {
+      radio.addEventListener("change", updateTotals);
+    });
+
+    const emailInput = document.getElementById("email");
+    const handleEmailLive = () => {
+      const value = emailInput.value.trim();
+      if (isValidEmail(value)) {
+        document.getElementById("error-email").textContent = "";
+      }
+    };
+    emailInput.addEventListener("input", handleEmailLive);
+    emailInput.addEventListener("blur", handleEmailLive);
+
+    document.getElementById("pay-now").addEventListener("click", () => {
+      const { valid } = validateForm();
+      if (!valid) return;
+      updateTotals();
+      const banner = document.getElementById("success-banner");
+      banner.style.display = "block";
+      banner.textContent = "Payment Successful!";
+    });
+
+    renderCart();
+  </script>
+</body>
+</html>

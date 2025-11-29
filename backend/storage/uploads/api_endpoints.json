@@ -1,0 +1,40 @@
+{
+  "POST /apply_coupon": {
+    "description": "Validate and apply a discount code to the active cart session.",
+    "payload": {
+      "code": "string"
+    },
+    "responses": {
+      "200": {
+        "applied": true,
+        "percent_off": 15,
+        "message": "SAVE15 applied successfully"
+      },
+      "400": {
+        "applied": false,
+        "message": "Invalid or ineligible code"
+      }
+    }
+  },
+  "POST /submit_order": {
+    "description": "Submit the checkout form and process payment.",
+    "payload": {
+      "name": "string",
+      "email": "string",
+      "address": "string",
+      "shipping": "standard|express",
+      "payment": "card|paypal",
+      "cart": [
+        {
+          "sku": "string",
+          "quantity": "number"
+        }
+      ],
+      "discount_code": "string|null"
+    },
+    "responses": {
+      "200": { "status": "success", "message": "Payment Successful!" },
+      "400": { "status": "error", "message": "Validation failed" }
+    }
+  }
+}

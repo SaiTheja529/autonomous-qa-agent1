@@ -1,0 +1,15 @@
+# Virtual Environments
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Databases / Vector Stores
+*.sqlite3
+*.bin
+
+# Frontend
+node_modules/
+
