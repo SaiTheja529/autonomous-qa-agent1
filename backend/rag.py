@@ -10,8 +10,8 @@ from typing import List
 
 from fastapi import HTTPException
 
-from .ingestion import get_collection, load_checkout_excerpt, load_checkout_html
-from .models import ContextChunk, GenerateScriptResponse, GenerateTestCasesResponse
+from ingestion import get_collection, load_checkout_excerpt, load_checkout_html
+from models import ContextChunk, GenerateScriptResponse, GenerateTestCasesResponse
 
 
 def _ensure_genai_client():

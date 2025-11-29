@@ -9,7 +9,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .ingestion import (
+from ingestion import (
     UPLOAD_DIR,
     CHECKOUT_PATH,
     ingest_files,
@@ -17,14 +17,14 @@ from .ingestion import (
     load_checkout_excerpt,
     load_checkout_html,
 )
-from .models import (
+from models import (
     GenerateScriptRequest,
     GenerateScriptResponse,
     GenerateTestCasesRequest,
     GenerateTestCasesResponse,
     IngestResponse,
 )
-from .rag import generate_selenium_script, generate_test_cases
+from rag import generate_selenium_script, generate_test_cases
 
 logger = logging.getLogger("uvicorn.error")
 
