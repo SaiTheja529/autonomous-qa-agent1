@@ -1,0 +1,37 @@
+services:
+  selenium:
+    image: selenium/standalone-chrome:155.0-20261101
+    ports:
+      - "4444:4444"
+    shm_size: 2gb
+    environment:
+      SE_NODE_MAX_SESSIONS: 4
+      SE_NODE_SESSION_TIMEOUT: 300
+
+  backend:
+    build: .
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000
+    environment:
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      REMOTE_WEBDRIVER_URL: http://selenium:4444/wd/hub
+      RUN_TIMEOUT_SECONDS: "300"
+    ports:
+      - "8000:8000"
+    volumes:
+      - backend-storage:/app/backend/storage
+    depends_on:
+      - selenium
+
+  frontend:
+    build: .
+    command: streamlit run frontend/app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
+    environment:
+      BACKEND_URL: http://backend:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      - backend
+
+volumes:
+  backend-storage:

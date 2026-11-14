@@ -206,12 +206,26 @@ You are a senior QA automation engineer writing Selenium (Python) scripts.
 Use the checkout HTML and documentation context to generate an executable script that automates the test case.
 
 Requirements:
-- Use Selenium 4 Python style: webdriver.Chrome(), WebDriverWait with expected_conditions.
+- Use Selenium 4 Python style with a REMOTE WebDriver. Connect via:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    import os
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    driver = webdriver.Remote(
+        command_executor=os.environ.get("REMOTE_WEBDRIVER_URL", "http://localhost:4444/wd/hub"),
+        options=options,
+    )
+- Use WebDriverWait with expected_conditions for element lookups.
 - Prefer IDs or names for selectors; fall back to CSS selectors if needed.
 - Set `base_url = "{base_url}"` at the top of the script so it runs against the served checkout page.
 - Apply discount codes, select shipping/payment, and validate inline error or success messages when applicable.
 - Include assertions for expected results described in the test case.
-- Keep the script self-contained (imports + main guard).
+- Wrap the test body in try/except: on ANY exception or assertion failure, call
+  `driver.save_screenshot("failure.png")` before re-raising. Always call `driver.quit()`.
+- Keep the script self-contained (imports + main guard). Output only Python code.
 
 Test Case:
 {test_case}

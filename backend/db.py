@@ -220,3 +220,109 @@ def test_case_to_record(row: TestCaseRow):
         status=row.status or "active",
         created_at=row.created_at,
     )
+
+
+# --- Script helpers ---------------------------------------------------
+
+def create_script(
+    code: str,
+    test_case_id: Optional[int] = None,
+    base_url: str = "",
+) -> Script:
+    ensure_db()
+    with SessionLocal() as session:
+        version = 1
+        if test_case_id is not None:
+            latest = session.scalar(
+                select(Script)
+                .where(Script.test_case_id == test_case_id)
+                .order_by(Script.version.desc())
+                .limit(1)
+            )
+            if latest is not None:
+                version = latest.version + 1
+        row = Script(
+            test_case_id=test_case_id,
+            version=version,
+            code=code,
+            base_url=base_url or "",
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return row
+
+
+def get_script(script_id: int) -> Optional[Script]:
+    ensure_db()
+    with SessionLocal() as session:
+        return session.get(Script, script_id)
+
+
+def get_latest_script_for_test_case(test_case_id: int) -> Optional[Script]:
+    ensure_db()
+    with SessionLocal() as session:
+        return session.scalar(
+            select(Script)
+            .where(Script.test_case_id == test_case_id)
+            .order_by(Script.version.desc())
+            .limit(1)
+        )
+
+
+# --- Run helpers ------------------------------------------------------
+
+def create_run(script_id: Optional[int] = None) -> Run:
+    ensure_db()
+    with SessionLocal() as session:
+        row = Run(script_id=script_id, status="pending")
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return row
+
+
+def update_run(run_id: int, **fields) -> Optional[Run]:
+    allowed = {"script_id", "status", "log", "screenshot_path", "healed", "started_at", "finished_at"}
+    updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
+    if not updates:
+        return get_run(run_id)
+    ensure_db()
+    with SessionLocal() as session:
+        row = session.get(Run, run_id)
+        if row is None:
+            return None
+        for key, value in updates.items():
+            setattr(row, key, value)
+        session.commit()
+        session.refresh(row)
+        return row
+
+
+def get_run(run_id: int) -> Optional[Run]:
+    ensure_db()
+    with SessionLocal() as session:
+        return session.get(Run, run_id)
+
+
+def run_to_record(row: Run):
+    """Convert a Run ORM object into the API RunRecord model."""
+    from models import RunRecord
+
+    screenshot_url = None
+    if row.screenshot_path and (STORAGE_DIR / row.screenshot_path).exists():
+        screenshot_url = f"/runs/{row.id}/screenshot"
+    log = row.log or ""
+    tail = "\n".join(log.splitlines()[-50:])
+    return RunRecord(
+        id=row.id,
+        script_id=row.script_id,
+        status=row.status or "pending",
+        log=log,
+        log_tail=tail,
+        screenshot_path=row.screenshot_path or "",
+        screenshot_url=screenshot_url,
+        healed=bool(row.healed),
+        started_at=row.started_at,
+        finished_at=row.finished_at,
+    )

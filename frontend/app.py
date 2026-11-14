@@ -65,6 +65,29 @@ def delete_test_case(test_case_id: int):
     return resp.status_code
 
 
+def run_test_case(test_case_id: int, script_code: Optional[str] = None, base_url: Optional[str] = None):
+    payload = {}
+    if script_code:
+        payload["script_code"] = script_code
+    if base_url:
+        payload["base_url"] = base_url
+    resp = requests.post(f"{BACKEND_URL}/testcases/{test_case_id}/run", json=payload, timeout=180)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def get_run(run_id: int):
+    resp = requests.get(f"{BACKEND_URL}/runs/{run_id}", timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def get_run_screenshot(run_id: int):
+    resp = requests.get(f"{BACKEND_URL}/runs/{run_id}/screenshot", timeout=30)
+    resp.raise_for_status()
+    return resp.content
+
+
 def case_label(case: dict) -> str:
     cid = case.get("id")
     scenario = case.get("scenario", "")
@@ -315,7 +338,40 @@ elif page == "cases":
                             st.success(f"Test case #{selected['id']} deleted.")
                         except Exception as exc:
                             st.error(f"Delete failed: {exc}")
+                    if st.button("Run test", use_container_width=True):
+                        try:
+                            run = run_test_case(selected["id"])
+                            st.session_state["active_run_id"] = run["id"]
+                            st.success(f"Run #{run['id']} started for test case #{selected['id']}.")
+                        except Exception as exc:
+                            st.error(f"Failed to start run: {exc}")
         st.markdown('</div>', unsafe_allow_html=True)
+
+    # --- Run results panel ---
+    active_run_id = st.session_state.get("active_run_id")
+    if active_run_id:
+        st.markdown("#### Latest run")
+        rcol, rbtn = st.columns([3, 1])
+        with rbtn:
+            if st.button("Refresh", use_container_width=True):
+                st.rerun()
+        try:
+            run = get_run(active_run_id)
+        except Exception as exc:
+            st.error(f"Failed to fetch run #{active_run_id}: {exc}")
+        else:
+            status = run.get("status", "unknown")
+            badge = {"passed": "✅", "failed": "❌", "error": "💥", "running": "⏳"}.get(status, "•")
+            st.markdown(f"**Run #{run['id']}** — {badge} `{status}`  \nScript #{run.get('script_id')}")
+            if run.get("log_tail"):
+                with st.expander("Log tail", expanded=True):
+                    st.code(run["log_tail"], language="text")
+            if run.get("screenshot_url"):
+                try:
+                    img = get_run_screenshot(run["id"])
+                    st.image(img, caption=f"Screenshot for run #{run['id']}")
+                except Exception as exc:
+                    st.warning(f"Screenshot unavailable: {exc}")
 
 # --- Selenium Scripts Page ---
 elif page == "scripts":
