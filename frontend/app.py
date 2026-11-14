@@ -9,6 +9,17 @@ import streamlit as st
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 
 
+def _headers() -> dict:
+    """X-API-Key header for backend auth (env API_KEY or sidebar input)."""
+    key = os.getenv("API_KEY") or st.session_state.get("api_key", "")
+    return {"X-API-Key": key} if key else {}
+
+
+def _project_id() -> str:
+    """Active project id (sidebar input, env PROJECT_ID, or 'default')."""
+    return st.session_state.get("project_id") or os.getenv("PROJECT_ID", "default")
+
+
 def check_backend() -> bool:
     try:
         resp = requests.get(f"{BACKEND_URL}/health", timeout=5)
@@ -17,39 +28,80 @@ def check_backend() -> bool:
         return False
 
 
-def ingest_documents(docs: List, checkout_html: Optional, reset: bool, chunk_size: int, overlap: int, top_k: int):
+def ingest_documents(docs: List, checkout_html: Optional, page_htmls: List, reset: bool, chunk_size: int, overlap: int, top_k: int):
     files = []
     for doc in docs:
         files.append(("docs", (doc.name, doc.getvalue(), doc.type)))
     if checkout_html:
         files.append(("checkout", (checkout_html.name, checkout_html.getvalue(), checkout_html.type)))
+    for page in page_htmls:
+        files.append(("pages", (page.name, page.getvalue(), page.type)))
     data = {
         "reset": str(reset).lower(),
+        "project_id": _project_id(),
         "chunk_size": str(chunk_size),
         "overlap": str(overlap),
         "top_k": str(top_k),
     }
     # Allow extra time for first-time model downloads/embeddings
-    resp = requests.post(f"{BACKEND_URL}/ingest", files=files, data=data, timeout=240)
+    resp = requests.post(f"{BACKEND_URL}/ingest", files=files, data=data, headers=_headers(), timeout=240)
     resp.raise_for_status()
     return resp.json()
 
 
 def generate_test_cases(query: str, top_k: int):
-    payload = {"query": query, "top_k": top_k}
-    resp = requests.post(f"{BACKEND_URL}/generate-testcases", json=payload, timeout=120)
+    payload = {"query": query, "top_k": top_k, "project_id": _project_id()}
+    resp = requests.post(f"{BACKEND_URL}/generate-testcases", json=payload, headers=_headers(), timeout=120)
     resp.raise_for_status()
     return resp.json()
 
 
-def generate_script(test_case: str, top_k: int, base_url: str, review: bool = False):
-    payload = {"test_case": test_case, "top_k": top_k, "base_url": base_url, "review": review}
-    resp = requests.post(f"{BACKEND_URL}/generate-script", json=payload, timeout=120)
+def list_pages():
+    resp = requests.get(f"{BACKEND_URL}/pages", params={"project_id": _project_id()}, headers=_headers(), timeout=30)
     resp.raise_for_status()
     return resp.json()
 
 
-def generate_script_stream(test_case: str, top_k: int, base_url: str, review: bool = False):
+def upload_pages(page_files: List):
+    files = [("files", (f.name, f.getvalue(), f.type or "text/html")) for f in page_files]
+    resp = requests.post(
+        f"{BACKEND_URL}/pages/upload",
+        files=files,
+        data={"project_id": _project_id()},
+        headers=_headers(),
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def crawl_page(url: str, name: Optional[str] = None):
+    payload = {"url": url, "project_id": _project_id()}
+    if name:
+        payload["name"] = name
+    resp = requests.post(f"{BACKEND_URL}/pages/crawl", json=payload, headers=_headers(), timeout=60)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def delete_page(page_id: int):
+    resp = requests.delete(f"{BACKEND_URL}/pages/{page_id}", headers=_headers(), timeout=30)
+    resp.raise_for_status()
+    return resp.status_code
+
+
+def generate_script(test_case: str, top_k: int, base_url: Optional[str], review: bool = False, page_id: Optional[int] = None):
+    payload = {"test_case": test_case, "top_k": top_k, "project_id": _project_id(), "review": review}
+    if page_id is not None:
+        payload["page_id"] = page_id
+    if base_url:
+        payload["base_url"] = base_url
+    resp = requests.post(f"{BACKEND_URL}/generate-script", json=payload, headers=_headers(), timeout=120)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def generate_script_stream(test_case: str, top_k: int, base_url: Optional[str], review: bool = False, page_id: Optional[int] = None):
     """
     POST /generate-script/stream and return (metadata, chunk_iterator).
 
@@ -57,8 +109,12 @@ def generate_script_stream(test_case: str, top_k: int, base_url: str, review: bo
     checkout excerpt); subsequent chunks are the script text followed by an
     optional ``--- REVIEW ---`` section when review=True.
     """
-    payload = {"test_case": test_case, "top_k": top_k, "base_url": base_url, "review": review}
-    resp = requests.post(f"{BACKEND_URL}/generate-script/stream", json=payload, stream=True, timeout=300)
+    payload = {"test_case": test_case, "top_k": top_k, "project_id": _project_id(), "review": review}
+    if page_id is not None:
+        payload["page_id"] = page_id
+    if base_url:
+        payload["base_url"] = base_url
+    resp = requests.post(f"{BACKEND_URL}/generate-script/stream", json=payload, headers=_headers(), stream=True, timeout=300)
     resp.raise_for_status()
     chunks = resp.iter_content(chunk_size=1024, decode_unicode=True)
 
@@ -91,57 +147,62 @@ def generate_script_stream(test_case: str, top_k: int, base_url: str, review: bo
 
 
 def export_test_cases(fmt: str):
-    resp = requests.get(f"{BACKEND_URL}/testcases/export", params={"format": fmt}, timeout=60)
+    resp = requests.get(
+        f"{BACKEND_URL}/testcases/export",
+        params={"format": fmt, "project_id": _project_id()},
+        headers=_headers(),
+        timeout=60,
+    )
     resp.raise_for_status()
     return resp.content
 
 
 def get_test_cases(status: Optional[str] = None):
-    params = {}
+    params = {"project_id": _project_id()}
     if status:
         params["status"] = status
-    resp = requests.get(f"{BACKEND_URL}/testcases", params=params, timeout=30)
+    resp = requests.get(f"{BACKEND_URL}/testcases", params=params, headers=_headers(), timeout=30)
     resp.raise_for_status()
     return resp.json()
 
 
 def update_test_case(test_case_id: int, fields: dict):
-    resp = requests.patch(f"{BACKEND_URL}/testcases/{test_case_id}", json=fields, timeout=30)
+    resp = requests.patch(f"{BACKEND_URL}/testcases/{test_case_id}", json=fields, headers=_headers(), timeout=30)
     resp.raise_for_status()
     return resp.json()
 
 
 def delete_test_case(test_case_id: int):
-    resp = requests.delete(f"{BACKEND_URL}/testcases/{test_case_id}", timeout=30)
+    resp = requests.delete(f"{BACKEND_URL}/testcases/{test_case_id}", headers=_headers(), timeout=30)
     resp.raise_for_status()
     return resp.status_code
 
 
 def run_test_case(test_case_id: int, script_code: Optional[str] = None, base_url: Optional[str] = None):
-    payload = {}
+    payload = {"project_id": _project_id()}
     if script_code:
         payload["script_code"] = script_code
     if base_url:
         payload["base_url"] = base_url
-    resp = requests.post(f"{BACKEND_URL}/testcases/{test_case_id}/run", json=payload, timeout=180)
+    resp = requests.post(f"{BACKEND_URL}/testcases/{test_case_id}/run", json=payload, headers=_headers(), timeout=180)
     resp.raise_for_status()
     return resp.json()
 
 
 def get_coverage():
-    resp = requests.get(f"{BACKEND_URL}/coverage", timeout=30)
+    resp = requests.get(f"{BACKEND_URL}/coverage", params={"project_id": _project_id()}, headers=_headers(), timeout=30)
     resp.raise_for_status()
     return resp.json()
 
 
 def get_run(run_id: int):
-    resp = requests.get(f"{BACKEND_URL}/runs/{run_id}", timeout=30)
+    resp = requests.get(f"{BACKEND_URL}/runs/{run_id}", headers=_headers(), timeout=30)
     resp.raise_for_status()
     return resp.json()
 
 
 def get_run_screenshot(run_id: int):
-    resp = requests.get(f"{BACKEND_URL}/runs/{run_id}/screenshot", timeout=30)
+    resp = requests.get(f"{BACKEND_URL}/runs/{run_id}/screenshot", headers=_headers(), timeout=30)
     resp.raise_for_status()
     return resp.content
 
@@ -223,6 +284,24 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# --- Sidebar: auth + project ---
+with st.sidebar:
+    st.markdown("### ⚙️ Settings")
+    api_key = st.text_input(
+        "API Key (X-API-Key)",
+        value=os.getenv("API_KEY", ""),
+        type="password",
+        help="Required when the backend sets API_KEYS/API_KEY.",
+    )
+    st.session_state["api_key"] = api_key
+    project_id = st.text_input(
+        "Project ID",
+        value=os.getenv("PROJECT_ID", "default"),
+        help="Selects the per-project knowledge base, pages, and test cases.",
+    )
+    st.session_state["project_id"] = project_id or "default"
+    st.caption(f"Backend: {BACKEND_URL}")
+
 # --- Simple page state + Navbar ---
 PAGES = {
     "kb": "Knowledge Base",
@@ -286,6 +365,9 @@ if page == "kb":
                 "Upload support docs (MD, TXT, JSON, PDF)", type=["md", "txt", "json", "pdf"], accept_multiple_files=True
             )
             checkout_html = st.file_uploader("Upload checkout.html", type=["html", "htm"])
+            page_htmls = st.file_uploader(
+                "Upload page HTML files (multiple supported)", type=["html", "htm"], accept_multiple_files=True
+            )
             reset = st.checkbox("Reset existing knowledge base", value=False)
             chunk_size = st.slider("Chunk size (chars)", min_value=200, max_value=2000, value=800, step=50, key="ingest_chunk_size")
             overlap = st.slider("Chunk overlap (chars)", min_value=0, max_value=500, value=150, step=25, key="ingest_overlap")
@@ -294,25 +376,91 @@ if page == "kb":
             st.markdown("</div>", unsafe_allow_html=True)
 
     if submitted:
-        if not docs and not checkout_html:
-            st.error("Please upload at least one document or checkout.html.")
+        if not docs and not checkout_html and not page_htmls:
+            st.error("Please upload at least one document or page HTML.")
         else:
             with st.spinner("Ingesting documents..."):
                 try:
-                    result = ingest_documents(docs, checkout_html, reset, chunk_size, overlap, ingest_top_k)
+                    result = ingest_documents(
+                        docs, checkout_html, page_htmls or [], reset, chunk_size, overlap, ingest_top_k
+                    )
                     stale_note = ""
                     if result.get("changed_docs"):
                         stale_note = (
                             f" Changed docs: {', '.join(result['changed_docs'])}; "
                             f"marked {result.get('stale_marked', 0)} test case(s) stale."
                         )
+                    pages_note = f" Pages added: {result.get('pages_added', 0)}." if result.get("pages_added") else ""
                     st.success(
                         f"Ingested {result['docs_ingested']} docs with {result['chunks_added']} chunks. "
-                        f"Checkout saved: {result['html_saved']}.{stale_note}"
+                        f"Checkout saved: {result['html_saved']}.{stale_note}{pages_note}"
                     )
                     st.json(result)
                 except Exception as exc:
                     st.error(f"Ingestion failed: {exc}")
+
+    # --- Pages under test ---
+    st.markdown("### 🌐 Pages under test")
+    st.caption("Uploaded HTML files and crawled URLs become pages that scripts can target.")
+    pcol1, pcol2 = st.columns(2)
+    with pcol1:
+        page_uploads = st.file_uploader(
+            "Upload HTML pages", type=["html", "htm"], accept_multiple_files=True, key="pages_upload"
+        )
+        if st.button("Add pages", use_container_width=True, disabled=not page_uploads):
+            try:
+                added = upload_pages(page_uploads)
+                st.success(f"Added {len(added)} page(s).")
+                st.session_state["pages_cache"] = None
+            except Exception as exc:
+                st.error(f"Page upload failed: {exc}")
+    with pcol2:
+        crawl_url = st.text_input("Or crawl a URL", key="crawl_url", placeholder="https://example.com")
+        crawl_name = st.text_input("Page name (optional)", key="crawl_name")
+        if st.button("Crawl page", use_container_width=True, disabled=not crawl_url.strip()):
+            try:
+                page = crawl_page(crawl_url.strip(), name=crawl_name.strip() or None)
+                st.success(f"Crawled page #{page['id']}: {page.get('name') or page['url']}")
+                st.session_state["pages_cache"] = None
+            except Exception as exc:
+                st.error(f"Crawl failed: {exc}")
+
+    try:
+        pages_list = st.session_state.get("pages_cache")
+        if pages_list is None:
+            pages_list = list_pages()
+            st.session_state["pages_cache"] = pages_list
+        if pages_list:
+            pdf = pd.DataFrame(
+                [
+                    {
+                        "id": p["id"],
+                        "name": p.get("name", ""),
+                        "url": p.get("url", ""),
+                        "source": p.get("source_type", ""),
+                        "project": p.get("project_id", ""),
+                    }
+                    for p in pages_list
+                ]
+            )
+            st.dataframe(pdf, use_container_width=True, hide_index=True)
+            del_col, _, _ = st.columns([1, 2, 5])
+            with del_col:
+                del_id = st.selectbox(
+                    "Delete page", options=[p["id"] for p in pages_list],
+                    format_func=lambda i: f"#{i}", key="pages_delete_select",
+                )
+                if st.button("Delete", use_container_width=True):
+                    try:
+                        delete_page(del_id)
+                        st.session_state["pages_cache"] = None
+                        st.success(f"Page #{del_id} deleted.")
+                    except Exception as exc:
+                        st.error(f"Delete failed: {exc}")
+        else:
+            st.info("No pages yet for this project.")
+    except Exception as exc:
+        st.error(f"Failed to load pages: {exc}")
 
 # --- Test Cases Page ---
 elif page == "cases":
@@ -510,10 +658,24 @@ elif page == "scripts":
         script_top_k = st.slider(
             "Context chunks for Selenium prompt", min_value=3, max_value=12, value=6, step=1, key="script_top_k"
         )
+        # Page under test: explicit selection, or the project's latest page
+        selected_page_id: Optional[int] = None
+        try:
+            script_pages = list_pages()
+        except Exception:
+            script_pages = []
+        if script_pages:
+            page_options = ["(project default / latest page)"] + [
+                f"#{p['id']}: {p.get('name') or p.get('url') or 'page'}" for p in script_pages
+            ]
+            page_choice = st.selectbox("Page under test", page_options, key="scripts_page_select")
+            if page_choice != page_options[0]:
+                selected_page_id = script_pages[page_options.index(page_choice) - 1]["id"]
         base_url = st.text_input(
-            "Base URL where checkout.html is served",
-            value="http://localhost:8000/checkout/checkout.html",
-            help="The generated script will set base_url to this value.",
+            "Base URL override (optional)",
+            value="",
+            placeholder="Auto: /checkout serves the selected page",
+            help="Leave blank to auto-derive from the selected page / project.",
         )
         review_flag = st.checkbox(
             "Review script (second Gemini pass: selector robustness + missing assertions)",
@@ -526,7 +688,11 @@ elif page == "scripts":
             else:
                 try:
                     meta, stream = generate_script_stream(
-                        manual_input.strip(), script_top_k, base_url.strip(), review=review_flag
+                        manual_input.strip(),
+                        script_top_k,
+                        base_url.strip() or None,
+                        review=review_flag,
+                        page_id=selected_page_id,
                     )
                     accumulated: List[str] = []
 

@@ -13,6 +13,19 @@ class ContextChunk(BaseModel):
     chunk_id: str
 
 
+class PageRecord(BaseModel):
+    """A persisted page under test (uploaded HTML or crawled DOM snapshot)."""
+
+    id: int
+    project_id: str = "default"
+    name: str = ""
+    url: str = ""
+    source_type: str = "upload"
+    file_path: str = ""
+    dom_snapshot: str = ""
+    created_at: Optional[datetime] = None
+
+
 class IngestResponse(BaseModel):
     docs_ingested: int
     chunks_added: int
@@ -20,11 +33,22 @@ class IngestResponse(BaseModel):
     html_saved: bool
     changed_docs: List[str] = Field(default_factory=list)
     stale_marked: int = 0
+    pages_added: int = 0
+    pages: List[PageRecord] = Field(default_factory=list)
+
+
+class CrawlPageRequest(BaseModel):
+    """Request to crawl a URL and store its DOM snapshot as a page."""
+
+    url: str = Field(..., description="URL to fetch and snapshot")
+    project_id: str = Field("default", description="Project this page belongs to")
+    name: Optional[str] = Field(None, description="Display name (defaults to page title/URL)")
 
 
 class GenerateTestCasesRequest(BaseModel):
     query: str = Field(..., description="User prompt describing which test cases to generate")
     top_k: Optional[int] = Field(None, description="How many context chunks to retrieve (defaults to the value set via /ingest)")
+    project_id: str = Field("default", description="Project whose knowledge base to query")
 
 
 class TestCase(BaseModel):
@@ -41,6 +65,7 @@ class TestCaseRecord(BaseModel):
     """A persisted test case as returned by the API."""
 
     id: int
+    project_id: str = "default"
     feature: str
     scenario: str
     steps: str = ""
@@ -71,9 +96,11 @@ class GenerateTestCasesResponse(BaseModel):
 class GenerateScriptRequest(BaseModel):
     test_case: str = Field(..., description="Single test case description to automate")
     top_k: Optional[int] = Field(None, description="How many context chunks to retrieve (defaults to the value set via /ingest)")
-    base_url: str = Field(
-        "http://localhost:8000/checkout/checkout.html",
-        description="Base URL where checkout.html is served",
+    page_id: Optional[int] = Field(None, description="Page under test; defaults to the project's selected page")
+    project_id: str = Field("default", description="Project whose knowledge base and pages to use")
+    base_url: Optional[str] = Field(
+        None,
+        description="Base URL where the page is served (auto-derived from page_id/project_id when omitted)",
     )
     review: bool = Field(False, description="Run a second Gemini pass critiquing selector robustness and missing assertions")
 
@@ -94,12 +121,14 @@ class RunTestCaseRequest(BaseModel):
     )
     base_url: Optional[str] = Field(None, description="Base URL override for script generation.")
     top_k: Optional[int] = Field(None, description="Context chunks to retrieve when generating a script.")
+    project_id: Optional[str] = Field(None, description="Project override (defaults to the test case's project).")
 
 
 class RunRecord(BaseModel):
     """A persisted test execution run as returned by the API."""
 
     id: int
+    project_id: str = "default"
     script_id: Optional[int] = None
     status: str = "pending"
     log: str = ""

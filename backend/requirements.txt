@@ -9,3 +9,4 @@ PyMuPDF==1.26.6
 selenium==4.38.0
 google-genai==1.0.0
 sqlalchemy==2.0.41
+beautifulsoup4==4.13.4
