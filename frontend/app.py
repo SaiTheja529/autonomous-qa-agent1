@@ -17,13 +17,18 @@ def check_backend() -> bool:
         return False
 
 
-def ingest_documents(docs: List, checkout_html: Optional, reset: bool):
+def ingest_documents(docs: List, checkout_html: Optional, reset: bool, chunk_size: int, overlap: int, top_k: int):
     files = []
     for doc in docs:
         files.append(("docs", (doc.name, doc.getvalue(), doc.type)))
     if checkout_html:
         files.append(("checkout", (checkout_html.name, checkout_html.getvalue(), checkout_html.type)))
-    data = {"reset": str(reset).lower()}
+    data = {
+        "reset": str(reset).lower(),
+        "chunk_size": str(chunk_size),
+        "overlap": str(overlap),
+        "top_k": str(top_k),
+    }
     # Allow extra time for first-time model downloads/embeddings
     resp = requests.post(f"{BACKEND_URL}/ingest", files=files, data=data, timeout=240)
     resp.raise_for_status()
@@ -37,11 +42,58 @@ def generate_test_cases(query: str, top_k: int):
     return resp.json()
 
 
-def generate_script(test_case: str, top_k: int, base_url: str):
-    payload = {"test_case": test_case, "top_k": top_k, "base_url": base_url}
+def generate_script(test_case: str, top_k: int, base_url: str, review: bool = False):
+    payload = {"test_case": test_case, "top_k": top_k, "base_url": base_url, "review": review}
     resp = requests.post(f"{BACKEND_URL}/generate-script", json=payload, timeout=120)
     resp.raise_for_status()
     return resp.json()
+
+
+def generate_script_stream(test_case: str, top_k: int, base_url: str, review: bool = False):
+    """
+    POST /generate-script/stream and return (metadata, chunk_iterator).
+
+    The stream begins with a ``__META__<json>`` header line (contexts +
+    checkout excerpt); subsequent chunks are the script text followed by an
+    optional ``--- REVIEW ---`` section when review=True.
+    """
+    payload = {"test_case": test_case, "top_k": top_k, "base_url": base_url, "review": review}
+    resp = requests.post(f"{BACKEND_URL}/generate-script/stream", json=payload, stream=True, timeout=300)
+    resp.raise_for_status()
+    chunks = resp.iter_content(chunk_size=1024, decode_unicode=True)
+
+    buf = ""
+    while "\n" not in buf:
+        piece = next(chunks, "")
+        if piece == "":
+            break
+        buf += piece
+
+    meta: dict = {}
+    rest = buf
+    if buf.startswith("__META__"):
+        line, _, rest = buf.partition("\n")
+        try:
+            meta = json.loads(line[len("__META__"):])
+        except Exception:
+            meta = {}
+
+    def gen():
+        try:
+            if rest:
+                yield rest
+            for piece in chunks:
+                yield piece
+        finally:
+            resp.close()
+
+    return meta, gen()
+
+
+def export_test_cases(fmt: str):
+    resp = requests.get(f"{BACKEND_URL}/testcases/export", params={"format": fmt}, timeout=60)
+    resp.raise_for_status()
+    return resp.content
 
 
 def get_test_cases(status: Optional[str] = None):
@@ -235,6 +287,9 @@ if page == "kb":
             )
             checkout_html = st.file_uploader("Upload checkout.html", type=["html", "htm"])
             reset = st.checkbox("Reset existing knowledge base", value=False)
+            chunk_size = st.slider("Chunk size (chars)", min_value=200, max_value=2000, value=800, step=50, key="ingest_chunk_size")
+            overlap = st.slider("Chunk overlap (chars)", min_value=0, max_value=500, value=150, step=25, key="ingest_overlap")
+            ingest_top_k = st.slider("Default top_k for generation", min_value=3, max_value=12, value=6, step=1, key="ingest_top_k")
             submitted = st.form_submit_button("Build Knowledge Base", use_container_width=True)
             st.markdown("</div>", unsafe_allow_html=True)
 
@@ -244,10 +299,16 @@ if page == "kb":
         else:
             with st.spinner("Ingesting documents..."):
                 try:
-                    result = ingest_documents(docs, checkout_html, reset)
+                    result = ingest_documents(docs, checkout_html, reset, chunk_size, overlap, ingest_top_k)
+                    stale_note = ""
+                    if result.get("changed_docs"):
+                        stale_note = (
+                            f" Changed docs: {', '.join(result['changed_docs'])}; "
+                            f"marked {result.get('stale_marked', 0)} test case(s) stale."
+                        )
                     st.success(
                         f"Ingested {result['docs_ingested']} docs with {result['chunks_added']} chunks. "
-                        f"Checkout saved: {result['html_saved']}."
+                        f"Checkout saved: {result['html_saved']}.{stale_note}"
                     )
                     st.json(result)
                 except Exception as exc:
@@ -298,7 +359,7 @@ elif page == "cases":
         with col_status_filter:
             status_filter = st.selectbox(
                 "Filter by status",
-                options=["", "active", "draft", "archived"],
+                options=["", "active", "draft", "archived", "stale"],
                 format_func=lambda s: s or "all",
                 key="cases_status_filter",
             )
@@ -324,9 +385,9 @@ elif page == "cases":
                 with status_col:
                     new_status = st.selectbox(
                         "Status",
-                        options=["active", "draft", "archived"],
-                        index=["active", "draft", "archived"].index(selected.get("status", "active"))
-                        if selected.get("status", "active") in ["active", "draft", "archived"]
+                        options=["active", "draft", "archived", "stale"],
+                        index=["active", "draft", "archived", "stale"].index(selected.get("status", "active"))
+                        if selected.get("status", "active") in ["active", "draft", "archived", "stale"]
                         else 0,
                         key="cases_status_select",
                     )
@@ -352,6 +413,40 @@ elif page == "cases":
                             st.success(f"Run #{run['id']} started for test case #{selected['id']}.")
                         except Exception as exc:
                             st.error(f"Failed to start run: {exc}")
+
+        # --- Export ---
+        st.markdown("#### Export test cases")
+        exp_col1, exp_col2 = st.columns(2)
+        with exp_col1:
+            if st.button("Prepare CSV export", use_container_width=True):
+                try:
+                    st.session_state["export_csv"] = export_test_cases("csv")
+                    st.success("CSV export ready.")
+                except Exception as exc:
+                    st.error(f"CSV export failed: {exc}")
+        with exp_col2:
+            if st.button("Prepare pytest export", use_container_width=True):
+                try:
+                    st.session_state["export_pytest"] = export_test_cases("pytest")
+                    st.success("pytest export ready.")
+                except Exception as exc:
+                    st.error(f"pytest export failed: {exc}")
+        if st.session_state.get("export_csv"):
+            st.download_button(
+                "Download testcases.csv",
+                data=st.session_state["export_csv"],
+                file_name="testcases.csv",
+                mime="text/csv",
+                key="dl_csv",
+            )
+        if st.session_state.get("export_pytest"):
+            st.download_button(
+                "Download testcases_pytest.py",
+                data=st.session_state["export_pytest"],
+                file_name="testcases_pytest.py",
+                mime="text/x-python",
+                key="dl_pytest",
+            )
         st.markdown('</div>', unsafe_allow_html=True)
 
     # --- Run results panel ---
@@ -420,22 +515,40 @@ elif page == "scripts":
             value="http://localhost:8000/checkout/checkout.html",
             help="The generated script will set base_url to this value.",
         )
+        review_flag = st.checkbox(
+            "Review script (second Gemini pass: selector robustness + missing assertions)",
+            value=False,
+            key="script_review",
+        )
         if st.button("Generate Selenium Script", use_container_width=True):
             if not manual_input.strip():
                 st.error("Provide a test case to automate.")
             else:
-                with st.spinner("Generating Selenium script..."):
-                    try:
-                        result = generate_script(manual_input.strip(), script_top_k, base_url.strip())
-                        st.session_state["last_script"] = result["script"]
-                        st.session_state["last_script_contexts"] = result["contexts"]
-                        st.success("Selenium script generated and cached.")
-                    except Exception as exc:
-                        st.error(f"Failed to generate Selenium script: {exc}")
+                try:
+                    meta, stream = generate_script_stream(
+                        manual_input.strip(), script_top_k, base_url.strip(), review=review_flag
+                    )
+                    accumulated: List[str] = []
+
+                    def tapped():
+                        for chunk in stream:
+                            accumulated.append(chunk)
+                            yield chunk
+
+                    st.write_stream(tapped())
+                    full_text = "".join(accumulated)
+                    script_text, sep, review_text = full_text.partition("--- REVIEW ---")
+                    st.session_state["last_script"] = script_text.strip()
+                    st.session_state["last_script_contexts"] = meta.get("contexts", [])
+                    st.session_state["last_review"] = review_text.strip() if sep else ""
+                    st.success("Selenium script generated and cached.")
+                except Exception as exc:
+                    st.error(f"Failed to generate Selenium script: {exc}")
 
         # Always show the last generated script, even after navigation
         last_script = st.session_state.get("last_script")
         last_script_contexts = st.session_state.get("last_script_contexts", [])
+        last_review = st.session_state.get("last_review", "")
         if last_script:
             if last_script_contexts:
                 with st.expander("Retrieved context (last run)"):
@@ -443,6 +556,9 @@ elif page == "scripts":
                         st.markdown(f"**{ctx['source']}** — `{ctx['chunk_id']}`")
                         st.write(ctx["text"])
             st.code(last_script, language="python")
+        if last_review:
+            with st.expander("Gemini review"):
+                st.markdown(last_review)
         st.markdown('</div>', unsafe_allow_html=True)
 
 # --- Coverage / Traceability Page ---
