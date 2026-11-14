@@ -137,6 +137,13 @@ async def ingest_endpoint(
     This handler is robust to ingest_files returning either a dict, an object with
     attributes, or None.
     """
+    if chunk_size <= 0 or overlap < 0 or overlap >= chunk_size:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid chunk settings: require chunk_size > 0 and 0 <= overlap < chunk_size.",
+        )
+    if top_k < 1:
+        raise HTTPException(status_code=400, detail="top_k must be >= 1.")
     if not docs and checkout is None and not pages:
         raise HTTPException(status_code=400, detail="Upload at least one document or page HTML.")
 

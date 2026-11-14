@@ -185,7 +185,9 @@ def _chunk_text(text: str, chunk_size: int = 800, overlap: int = 150) -> List[st
                 chunks.append(segment)
                 if end >= length:
                     break
-                start = max(0, end - overlap)
+                next_start = max(0, end - overlap)
+                # Always advance to avoid an infinite loop when overlap >= chunk_size.
+                start = next_start if next_start > start else end
             continue
 
         if not current:

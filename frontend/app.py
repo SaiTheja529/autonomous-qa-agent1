@@ -370,7 +370,7 @@ if page == "kb":
             )
             reset = st.checkbox("Reset existing knowledge base", value=False)
             chunk_size = st.slider("Chunk size (chars)", min_value=200, max_value=2000, value=800, step=50, key="ingest_chunk_size")
-            overlap = st.slider("Chunk overlap (chars)", min_value=0, max_value=500, value=150, step=25, key="ingest_overlap")
+            overlap = st.slider("Chunk overlap (chars)", min_value=0, max_value=min(500, chunk_size - 50), value=min(150, chunk_size - 50), step=25, key="ingest_overlap")
             ingest_top_k = st.slider("Default top_k for generation", min_value=3, max_value=12, value=6, step=1, key="ingest_top_k")
             submitted = st.form_submit_button("Build Knowledge Base", use_container_width=True)
             st.markdown("</div>", unsafe_allow_html=True)
