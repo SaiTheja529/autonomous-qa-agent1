@@ -4,6 +4,7 @@ Utilities to ingest support documents and build a Chroma vector store.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import uuid
@@ -20,7 +21,15 @@ STORAGE_DIR = BASE_DIR / "storage"
 CHROMA_DIR = STORAGE_DIR / "vector_store"
 UPLOAD_DIR = STORAGE_DIR / "uploads"
 CHECKOUT_PATH = BASE_DIR / "checkout" / "checkout.html"
-COLLECTION_NAME = "testing_brain"
+PAGES_DIR = BASE_DIR / "pages"
+COLLECTION_PREFIX = "testing_brain"
+DEFAULT_PROJECT = "default"
+
+
+def collection_name(project_id: str = DEFAULT_PROJECT) -> str:
+    """Per-project Chroma collection name: ``testing_brain_{project_id}``."""
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in (project_id or DEFAULT_PROJECT))
+    return f"{COLLECTION_PREFIX}_{safe}"
 
 
 @dataclass
@@ -36,6 +45,7 @@ def _ensure_dirs() -> None:
     CHROMA_DIR.mkdir(parents=True, exist_ok=True)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     CHECKOUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PAGES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # --- Lightweight local embedding fallback (no heavy model) ---
@@ -69,6 +79,15 @@ class LocalHashEmbeddingFunction:
         matrix = self.vectorizer.transform(list(input))
         # Convert sparse matrix to a list of dense float lists
         return matrix.toarray().astype("float32").tolist()
+
+    def embed_documents(self, input):
+        return self(input)
+
+    def embed_query(self, input):
+        # Chroma may pass a single string for queries
+        if isinstance(input, str):
+            input = [input]
+        return self(input)
 
     def name(self) -> str:
         # Chroma expects an embedding function to expose a name()
@@ -118,19 +137,20 @@ def _client():
     return chromadb.PersistentClient(path=str(CHROMA_DIR))
 
 
-def get_collection(reset: bool = False):
+def get_collection(reset: bool = False, project_id: str = DEFAULT_PROJECT):
     """
-    Returns the Chroma collection, optionally resetting it first.
+    Returns the Chroma collection for ``project_id``, optionally resetting it first.
     """
+    name = collection_name(project_id)
     client = _client()
     if reset:
         try:
-            client.delete_collection(COLLECTION_NAME)
+            client.delete_collection(name)
         except Exception:
             # Collection may not exist on first run; ignore.
             pass
     collection = client.get_or_create_collection(
-        name=COLLECTION_NAME,
+        name=name,
         embedding_function=_embedding_function(),
         metadata={"hnsw:space": "cosine"},
     )
@@ -221,18 +241,87 @@ def save_checkout_html(content: bytes, filename: str = "checkout.html") -> Path:
     return CHECKOUT_PATH
 
 
-def ingest_files(file_paths: Iterable[Path], reset: bool = False) -> IngestResult:
+# --- Page storage (uploads + crawls) -----------------------------------
+
+def _page_dir(project_id: str) -> Path:
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in (project_id or DEFAULT_PROJECT))
+    path = PAGES_DIR / safe
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def store_page_html(html: str, project_id: str = DEFAULT_PROJECT, page_key: Optional[str] = None) -> tuple[Path, str]:
+    """
+    Write page HTML into ``backend/pages/{project_id}/`` and return
+    ``(absolute_path, path_relative_to_backend)``.
+    """
+    _ensure_dirs()
+    key = page_key or uuid.uuid4().hex
+    key = "".join(c if c.isalnum() or c in "-_." else "_" for c in key) or uuid.uuid4().hex
+    if key.startswith("."):
+        key = "_" + key
+    dest = _page_dir(project_id) / f"{key}.html"
+    dest.write_text(html, encoding="utf-8")
+    rel = str(dest.relative_to(BASE_DIR))
+    return dest, rel
+
+
+def load_page_file(rel_path: str) -> str:
+    """Read a stored page file given its path relative to ``backend/``."""
+    path = (BASE_DIR / rel_path).resolve()
+    if BASE_DIR.resolve() not in path.parents or not path.exists():
+        raise FileNotFoundError(f"Page file not found: {rel_path}")
+    return path.read_text(encoding="utf-8")
+
+
+def crawl_page(url: str, project_id: str = DEFAULT_PROJECT, timeout: int = 20) -> dict:
+    """
+    Fetch ``url``, parse it with BeautifulSoup, and return a DOM snapshot
+    (prettified HTML) plus metadata for creating a Page row.
+    """
+    import requests
+    from bs4 import BeautifulSoup
+
+    resp = requests.get(
+        url,
+        timeout=timeout,
+        headers={"User-Agent": "autonomous-qa-agent/0.1 (+page-crawler)"},
+        allow_redirects=True,
+    )
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    snapshot = soup.prettify()
+    title = (soup.title.string if soup.title and soup.title.string else "").strip()
+    return {
+        "url": resp.url,
+        "name": title or resp.url,
+        "dom_snapshot": snapshot,
+        "status_code": resp.status_code,
+    }
+
+
+def ingest_files(
+    file_paths: Iterable[Path],
+    reset: bool = False,
+    chunk_size: int = 800,
+    overlap: int = 150,
+    top_k: Optional[int] = None,
+    project_id: str = DEFAULT_PROJECT,
+) -> IngestResult:
     """
     Ingests a list of files into Chroma, chunking content and attaching metadata.
+
+    ``chunk_size``/``overlap`` control the text splitter; ``top_k`` (when
+    provided) is persisted as the default retrieval depth for generation.
     """
-    collection = get_collection(reset=reset)
+    collection = get_collection(reset=reset, project_id=project_id)
     docs_ingested = 0
     chunks_added = 0
     sources: List[str] = []
 
     for path in file_paths:
         text = _extract_text(path)
-        chunks = _chunk_text(text)
+        chunks = _chunk_text(text, chunk_size=chunk_size, overlap=overlap)
         if not chunks:
             continue
 
@@ -262,9 +351,28 @@ def ingest_files(file_paths: Iterable[Path], reset: bool = False) -> IngestResul
 
         # Chroma accepts a plain list of strings; avoid instantiating the typing alias.
         collection.add(documents=list(chunks), metadatas=metadatas, ids=ids)
+
+        # Record the document in the relational store for traceability/coverage.
+        try:
+            import db  # lazy import: keeps module import light
+
+            sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+            db.upsert_document(path.name, sha256, project_id=project_id)
+        except Exception as exc:
+            # Document bookkeeping should never break ingestion
+            print(f"[INGEST] failed to record document {path.name}: {exc}")
+
         docs_ingested += 1
         chunks_added += len(chunks)
         sources.append(path.name)
+
+    if top_k is not None:
+        try:
+            import db  # lazy import: keeps module import light
+
+            db.set_setting("top_k", str(max(1, int(top_k))), project_id=project_id)
+        except Exception as exc:
+            print(f"[INGEST] failed to persist top_k setting: {exc}")
 
     return IngestResult(
         docs_ingested=docs_ingested,
@@ -289,3 +397,40 @@ def load_checkout_excerpt(max_chars: int = 1200) -> str:
     """
     html = load_checkout_html()
     return html[:max_chars]
+
+
+def page_html(page) -> str:
+    """
+    Return the HTML/DOM snapshot for a Page row: prefer the stored file,
+    falling back to the dom_snapshot column.
+    """
+    if page.file_path:
+        try:
+            return load_page_file(page.file_path)
+        except FileNotFoundError:
+            pass
+    if page.dom_snapshot:
+        return page.dom_snapshot
+    raise FileNotFoundError(f"Page #{page.id} has no stored HTML or DOM snapshot.")
+
+
+def page_excerpt(page, max_chars: int = 1200) -> str:
+    return page_html(page)[:max_chars]
+
+
+def selected_page_html(page_id: Optional[int] = None, project_id: str = DEFAULT_PROJECT) -> Optional[str]:
+    """
+    HTML for the page selected for serving at /checkout: explicit ``page_id``,
+    else the latest page for ``project_id``. Returns None when no page exists.
+    """
+    import db  # lazy import to keep module import light
+
+    page = db.get_page(page_id) if page_id is not None else db.latest_page(project_id)
+    if page is None:
+        return None
+    return page_html(page)
+
+
+def default_page_base_url(project_id: str = DEFAULT_PROJECT, backend_url: str = "http://localhost:8000") -> str:
+    """Base URL that serves the project's selected page via /checkout."""
+    return f"{backend_url}/checkout/?project_id={project_id}"

@@ -32,6 +32,9 @@ pip install -r requirements.txt
 - `EMBEDDING_MODEL` (optional, default `all-MiniLM-L6-v2`)
 - `BACKEND_URL` (optional for Streamlit, default `http://localhost:8000`)
 - `DATABASE_URL` (optional, default `sqlite:///backend/storage/app.db`)
+- `API_KEYS` or `API_KEY` (optional; comma-separated keys accepted via the `X-API-Key` header. When unset, auth is disabled)
+- `PROJECT_ID` / `API_KEY` (optional Streamlit defaults for the sidebar inputs)
+- `BACKEND_PUBLIC_URL` (optional, default `http://localhost:8000`; used to build page base URLs in generated scripts)
 
 ## Running
 Open two terminals:
@@ -50,14 +53,29 @@ streamlit run frontend/app.py
 4. Copy the script and run it against a served copy of `backend/checkout/checkout.html` (adjust `base_url` inside the script as needed).
 
 ## API Quick Reference
-- `GET /health` — status check  
-- `POST /ingest` — multipart upload (`docs` files[], optional `checkout`), form field `reset` (bool)  
-- `POST /generate-testcases` — JSON `{ "query": str, "top_k": int }`  
-- `POST /generate-script` — JSON `{ "test_case": str, "top_k": int, "base_url": str }`  
-- `GET /testcases` — list persisted test cases (optional `?status=` filter)  
+- `GET /health` — status check (unauthenticated)  
+- `POST /ingest` — multipart upload (`docs` files[], optional `checkout`, `pages` files[] for multiple HTML pages), form fields `reset`, `project_id`, `chunk_size`, `overlap`, `top_k`  
+- `POST /generate-testcases` — JSON `{ "query": str, "top_k": int, "project_id": str }`  
+- `POST /generate-script` — JSON `{ "test_case": str, "top_k": int, "page_id": int, "project_id": str, "base_url": str, "review": bool }`  
+- `POST /generate-script/stream` — same payload as `/generate-script`, returns a streamed script  
+- `GET /testcases` — list persisted test cases (optional `?status=`, `?project_id=` filters)  
 - `PATCH /testcases/{id}` — partially update a test case (`feature`, `scenario`, `steps`, `expected`, `grounded_in`, `status`)  
 - `DELETE /testcases/{id}` — delete a test case  
-- `GET /checkout-html` — returns stored checkout HTML
+- `GET /testcases/{id}/run` → `POST /testcases/{id}/run` — generate/accept a script and execute it  
+- `GET /runs/{id}` / `GET /runs/{id}/screenshot` — run status, log, screenshot  
+- `GET /coverage` — document↔test-case traceability matrix (optional `?project_id=`)  
+- `POST /pages/upload` — multipart `files[]` HTML uploads + `project_id` form field  
+- `POST /pages/crawl` — JSON `{ "url": str, "project_id": str, "name": str }`; fetches the URL and stores a BeautifulSoup DOM snapshot  
+- `GET /pages` / `GET /pages/{id}` / `DELETE /pages/{id}` — page management  
+- `GET /checkout-html` — HTML/DOM snapshot of the selected page (optional `?page_id=`, `?project_id=`)  
+- `GET /checkout/` — serves the selected page's HTML (`?page_id=` or latest for `?project_id=`); `GET /checkout/page/{id}` serves a specific page; other `/checkout/*` paths fall through to the static mount
+
+All endpoints except `/health` and `/checkout*` require the `X-API-Key` header when `API_KEYS`/`API_KEY` is configured.
+
+## Projects & Pages
+- Every table (`documents`, `pages`, `test_cases`, `scripts`, `runs`, `settings`) carries a `project_id` column; pass `project_id` on requests to scope data.
+- Each project gets its own Chroma collection `testing_brain_{project_id}`.
+- Pages are stored as HTML files under `backend/pages/{project_id}/` with a DOM snapshot in the `pages` table; crawled pages are fetched and serialized with BeautifulSoup.
 
 ## Provided Assets
 - `support_docs/product_specs.md` — pricing, discount, validation rules

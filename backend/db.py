@@ -3,10 +3,15 @@
 SQLite persistence layer for the Autonomous QA Agent.
 
 Tables:
-  - documents: ingested support files (filename + sha256 dedupe)
+  - documents: ingested support files (filename + sha256 dedupe, per project)
+  - pages: HTML pages under test (uploads + crawled DOM snapshots, per project)
   - test_cases: generated/curated test cases
   - scripts: versioned Selenium scripts linked to test cases
   - runs: execution records for scripts
+  - settings: key/value config scoped per project
+
+Every table carries a ``project_id`` column so multiple projects can share
+one backend instance. ``project_id`` defaults to ``"default"``.
 """
 from __future__ import annotations
 
@@ -22,14 +27,17 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     create_engine,
     select,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 BASE_DIR = Path(__file__).resolve().parent
 STORAGE_DIR = BASE_DIR / "storage"
 DEFAULT_DB_PATH = STORAGE_DIR / "app.db"
+DEFAULT_PROJECT = "default"
 
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DEFAULT_DB_PATH}")
 
@@ -50,17 +58,33 @@ def _utcnow() -> datetime:
 
 class Document(Base):
     __tablename__ = "documents"
+    __table_args__ = (UniqueConstraint("project_id", "filename", name="uq_documents_project_filename"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    filename: Mapped[str] = mapped_column(String(512), unique=True, index=True)
+    project_id: Mapped[str] = mapped_column(String(64), default=DEFAULT_PROJECT, index=True)
+    filename: Mapped[str] = mapped_column(String(512), index=True)
     sha256: Mapped[str] = mapped_column(String(64))
     ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class Page(Base):
+    __tablename__ = "pages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    project_id: Mapped[str] = mapped_column(String(64), default=DEFAULT_PROJECT, index=True)
+    name: Mapped[str] = mapped_column(String(512))
+    url: Mapped[str] = mapped_column(String(2048), default="")
+    source_type: Mapped[str] = mapped_column(String(32), default="upload")  # upload | crawl
+    file_path: Mapped[str] = mapped_column(String(1024), default="")
+    dom_snapshot: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
 class TestCaseRow(Base):
     __tablename__ = "test_cases"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    project_id: Mapped[str] = mapped_column(String(64), default=DEFAULT_PROJECT, index=True)
     feature: Mapped[str] = mapped_column(String(512))
     scenario: Mapped[str] = mapped_column(Text)
     steps: Mapped[str] = mapped_column(Text, default="")
@@ -74,6 +98,7 @@ class Script(Base):
     __tablename__ = "scripts"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    project_id: Mapped[str] = mapped_column(String(64), default=DEFAULT_PROJECT, index=True)
     test_case_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("test_cases.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -83,10 +108,19 @@ class Script(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class Setting(Base):
+    __tablename__ = "settings"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    project_id: Mapped[str] = mapped_column(String(64), primary_key=True, default=DEFAULT_PROJECT)
+    value: Mapped[str] = mapped_column(Text, default="")
+
+
 class Run(Base):
     __tablename__ = "runs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    project_id: Mapped[str] = mapped_column(String(64), default=DEFAULT_PROJECT, index=True)
     script_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("scripts.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -106,10 +140,97 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False
 _db_ready = False
 
 
+def _table_columns(conn, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
+
+
+def _migrate() -> None:
+    """
+    Lightweight migrations for databases created before ``project_id`` existed.
+
+    - documents / settings are rebuilt because their uniqueness constraints
+      changed (documents: filename -> (project_id, filename);
+       settings: key -> (key, project_id)).
+    - all other tables simply gain a ``project_id`` column + index.
+    Safe to run repeatedly: every step is guarded by a column/existence check.
+    """
+    with engine.begin() as conn:
+        existing = {
+            row[0]
+            for row in conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            )
+        }
+
+        # Clean up a leftover from an interrupted earlier migration: preserve
+        # any rows still sitting in the legacy table, then drop it.
+        if (
+            "documents_legacy" in existing
+            and "documents" in existing
+            and "project_id" in _table_columns(conn, "documents")
+        ):
+            conn.execute(
+                text(
+                    "INSERT OR IGNORE INTO documents (id, filename, sha256, ingested_at, project_id) "
+                    "SELECT id, filename, sha256, ingested_at, :pid FROM documents_legacy"
+                ),
+                {"pid": DEFAULT_PROJECT},
+            )
+            conn.execute(text("DROP TABLE documents_legacy"))
+            existing.discard("documents_legacy")
+
+        if "documents" in existing and "project_id" not in _table_columns(conn, "documents"):
+            # Drop secondary indexes on the old table so their names don't
+            # collide when the rebuilt table creates its own.
+            for row in conn.execute(
+                text(
+                    "SELECT name FROM sqlite_master WHERE type='index' "
+                    "AND tbl_name='documents' AND name NOT LIKE 'sqlite_autoindex%'"
+                )
+            ):
+                conn.execute(text(f"DROP INDEX IF EXISTS {row[0]}"))
+            conn.execute(text("ALTER TABLE documents RENAME TO documents_legacy"))
+            Document.__table__.create(conn)
+            conn.execute(
+                text(
+                    "INSERT INTO documents (id, filename, sha256, ingested_at, project_id) "
+                    "SELECT id, filename, sha256, ingested_at, :pid FROM documents_legacy"
+                ),
+                {"pid": DEFAULT_PROJECT},
+            )
+            conn.execute(text("DROP TABLE documents_legacy"))
+            existing.discard("documents_legacy")
+
+        if "settings" in existing and "project_id" not in _table_columns(conn, "settings"):
+            conn.execute(text("ALTER TABLE settings RENAME TO settings_legacy"))
+            Setting.__table__.create(conn)
+            conn.execute(
+                text(
+                    "INSERT INTO settings (key, value, project_id) "
+                    "SELECT key, value, :pid FROM settings_legacy"
+                ),
+                {"pid": DEFAULT_PROJECT},
+            )
+            conn.execute(text("DROP TABLE settings_legacy"))
+
+        for table in ("test_cases", "scripts", "runs"):
+            if table in existing and "project_id" not in _table_columns(conn, table):
+                conn.execute(
+                    text(
+                        f"ALTER TABLE {table} ADD COLUMN project_id "
+                        f"VARCHAR(64) NOT NULL DEFAULT '{DEFAULT_PROJECT}'"
+                    )
+                )
+                conn.execute(
+                    text(f"CREATE INDEX IF NOT EXISTS ix_{table}_project_id ON {table} (project_id)")
+                )
+
+
 def init_db() -> None:
-    """Create all tables if they do not exist."""
+    """Create all tables if they do not exist, then apply migrations."""
     global _db_ready
     Base.metadata.create_all(engine)
+    _migrate()
     _db_ready = True
 
 
@@ -121,13 +242,17 @@ def ensure_db() -> None:
 
 # --- Document helpers -------------------------------------------------
 
-def upsert_document(filename: str, sha256: str) -> Document:
-    """Insert or update a document row keyed by filename."""
+def upsert_document(filename: str, sha256: str, project_id: str = DEFAULT_PROJECT) -> Document:
+    """Insert or update a document row keyed by (project_id, filename)."""
     ensure_db()
     with SessionLocal() as session:
-        doc = session.scalar(select(Document).where(Document.filename == filename))
+        doc = session.scalar(
+            select(Document).where(
+                Document.project_id == project_id, Document.filename == filename
+            )
+        )
         if doc is None:
-            doc = Document(filename=filename, sha256=sha256)
+            doc = Document(project_id=project_id, filename=filename, sha256=sha256)
             session.add(doc)
         else:
             doc.sha256 = sha256
@@ -135,6 +260,185 @@ def upsert_document(filename: str, sha256: str) -> Document:
         session.commit()
         session.refresh(doc)
         return doc
+
+
+def get_document(filename: str, project_id: str = DEFAULT_PROJECT) -> Optional[Document]:
+    """Fetch a document row by (project_id, filename), or None."""
+    ensure_db()
+    with SessionLocal() as session:
+        return session.scalar(
+            select(Document).where(
+                Document.project_id == project_id, Document.filename == filename
+            )
+        )
+
+
+def _doc_matches_grounded_in(filename: str, grounded_in: str) -> bool:
+    """
+    A test case is grounded in a document when its grounded_in citation
+    mentions the document filename (or its stem, e.g. "product_specs").
+    Matching is case-insensitive substring-based since grounded_in is free text.
+    """
+    grounded = (grounded_in or "").lower()
+    if not grounded:
+        return False
+    name = filename.lower()
+    stem = name.rsplit(".", 1)[0]
+    return name in grounded or (len(stem) >= 4 and stem in grounded)
+
+
+def get_coverage_report(project_id: Optional[str] = None) -> list[dict]:
+    """
+    Build a per-document coverage report.
+
+    Returns a list of dicts:
+      {
+        "document": {"id", "filename", "sha256", "ingested_at"},
+        "test_cases": [ {"id", "feature", "scenario", "grounded_in", "status"}, ... ],
+      }
+    where test_cases are those whose grounded_in cites the document.
+    """
+    ensure_db()
+    with SessionLocal() as session:
+        doc_stmt = select(Document).order_by(Document.filename)
+        case_stmt = select(TestCaseRow).order_by(TestCaseRow.id)
+        if project_id:
+            doc_stmt = doc_stmt.where(Document.project_id == project_id)
+            case_stmt = case_stmt.where(TestCaseRow.project_id == project_id)
+        docs = list(session.scalars(doc_stmt))
+        cases = list(session.scalars(case_stmt))
+
+    report = []
+    for doc in docs:
+        covering = [
+            {
+                "id": case.id,
+                "feature": case.feature,
+                "scenario": case.scenario,
+                "grounded_in": case.grounded_in or "",
+                "status": case.status or "active",
+            }
+            for case in cases
+            if _doc_matches_grounded_in(doc.filename, case.grounded_in or "")
+        ]
+        report.append(
+            {
+                "document": {
+                    "id": doc.id,
+                    "project_id": doc.project_id,
+                    "filename": doc.filename,
+                    "sha256": doc.sha256,
+                    "ingested_at": doc.ingested_at,
+                },
+                "test_cases": covering,
+            }
+        )
+    return report
+
+
+# --- Page helpers -----------------------------------------------------
+
+def create_page(
+    project_id: str = DEFAULT_PROJECT,
+    name: str = "",
+    url: str = "",
+    source_type: str = "upload",
+    file_path: str = "",
+    dom_snapshot: str = "",
+) -> Page:
+    ensure_db()
+    with SessionLocal() as session:
+        row = Page(
+            project_id=project_id,
+            name=name,
+            url=url,
+            source_type=source_type,
+            file_path=file_path,
+            dom_snapshot=dom_snapshot,
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return row
+
+
+def get_page(page_id: int) -> Optional[Page]:
+    ensure_db()
+    with SessionLocal() as session:
+        return session.get(Page, page_id)
+
+
+def list_pages(project_id: Optional[str] = None) -> list[Page]:
+    ensure_db()
+    with SessionLocal() as session:
+        stmt = select(Page).order_by(Page.id)
+        if project_id:
+            stmt = stmt.where(Page.project_id == project_id)
+        return list(session.scalars(stmt))
+
+
+def latest_page(project_id: str = DEFAULT_PROJECT) -> Optional[Page]:
+    """Most recently created page for a project (used as the /checkout default)."""
+    ensure_db()
+    with SessionLocal() as session:
+        return session.scalar(
+            select(Page)
+            .where(Page.project_id == project_id)
+            .order_by(Page.id.desc())
+            .limit(1)
+        )
+
+
+def delete_page(page_id: int) -> bool:
+    ensure_db()
+    with SessionLocal() as session:
+        row = session.get(Page, page_id)
+        if row is None:
+            return False
+        session.delete(row)
+        session.commit()
+        return True
+
+
+def page_to_record(row: Page):
+    """Convert a Page ORM object into the API PageRecord model."""
+    from models import PageRecord
+
+    return PageRecord(
+        id=row.id,
+        project_id=row.project_id or DEFAULT_PROJECT,
+        name=row.name or "",
+        url=row.url or "",
+        source_type=row.source_type or "upload",
+        file_path=row.file_path or "",
+        dom_snapshot=row.dom_snapshot or "",
+        created_at=row.created_at,
+    )
+
+
+# --- Settings helpers ---------------------------------------------------
+
+def get_setting(key: str, default: Optional[str] = None, project_id: str = DEFAULT_PROJECT) -> Optional[str]:
+    ensure_db()
+    with SessionLocal() as session:
+        row = session.scalar(
+            select(Setting).where(Setting.key == key, Setting.project_id == project_id)
+        )
+        return row.value if row is not None else default
+
+
+def set_setting(key: str, value: str, project_id: str = DEFAULT_PROJECT) -> None:
+    ensure_db()
+    with SessionLocal() as session:
+        row = session.scalar(
+            select(Setting).where(Setting.key == key, Setting.project_id == project_id)
+        )
+        if row is None:
+            row = Setting(key=key, project_id=project_id, value=value)
+            session.add(row)
+        else:
+            row.value = value
+        session.commit()
 
 
 # --- Test case helpers -------------------------------------------------
@@ -146,10 +450,12 @@ def create_test_case(
     expected: str = "",
     grounded_in: str = "",
     status: str = "active",
+    project_id: str = DEFAULT_PROJECT,
 ) -> TestCaseRow:
     ensure_db()
     with SessionLocal() as session:
         row = TestCaseRow(
+            project_id=project_id,
             feature=feature,
             scenario=scenario,
             steps=steps,
@@ -163,12 +469,16 @@ def create_test_case(
         return row
 
 
-def list_test_cases(status: Optional[str] = None) -> list[TestCaseRow]:
+def list_test_cases(
+    status: Optional[str] = None, project_id: Optional[str] = None
+) -> list[TestCaseRow]:
     ensure_db()
     with SessionLocal() as session:
         stmt = select(TestCaseRow).order_by(TestCaseRow.id)
         if status:
             stmt = stmt.where(TestCaseRow.status == status)
+        if project_id:
+            stmt = stmt.where(TestCaseRow.project_id == project_id)
         return list(session.scalars(stmt))
 
 
@@ -195,6 +505,29 @@ def update_test_case(test_case_id: int, fields: dict) -> Optional[TestCaseRow]:
         return row
 
 
+def mark_test_cases_stale(filenames: list[str], project_id: str = DEFAULT_PROJECT) -> int:
+    """
+    Mark test cases whose grounded_in references any of the given source
+    filenames as status='stale'. Returns the number of rows updated.
+    """
+    if not filenames:
+        return 0
+    ensure_db()
+    count = 0
+    with SessionLocal() as session:
+        stmt = select(TestCaseRow).where(TestCaseRow.status != "stale")
+        if project_id:
+            stmt = stmt.where(TestCaseRow.project_id == project_id)
+        rows = session.scalars(stmt)
+        for row in rows:
+            grounded = row.grounded_in or ""
+            if any(_doc_matches_grounded_in(name, grounded) for name in filenames):
+                row.status = "stale"
+                count += 1
+        session.commit()
+    return count
+
+
 def delete_test_case(test_case_id: int) -> bool:
     ensure_db()
     with SessionLocal() as session:
@@ -212,6 +545,7 @@ def test_case_to_record(row: TestCaseRow):
 
     return TestCaseRecord(
         id=row.id,
+        project_id=row.project_id or DEFAULT_PROJECT,
         feature=row.feature,
         scenario=row.scenario,
         steps=row.steps or "",
@@ -228,6 +562,7 @@ def create_script(
     code: str,
     test_case_id: Optional[int] = None,
     base_url: str = "",
+    project_id: str = DEFAULT_PROJECT,
 ) -> Script:
     ensure_db()
     with SessionLocal() as session:
@@ -242,6 +577,7 @@ def create_script(
             if latest is not None:
                 version = latest.version + 1
         row = Script(
+            project_id=project_id,
             test_case_id=test_case_id,
             version=version,
             code=code,
@@ -272,10 +608,10 @@ def get_latest_script_for_test_case(test_case_id: int) -> Optional[Script]:
 
 # --- Run helpers ------------------------------------------------------
 
-def create_run(script_id: Optional[int] = None) -> Run:
+def create_run(script_id: Optional[int] = None, project_id: str = DEFAULT_PROJECT) -> Run:
     ensure_db()
     with SessionLocal() as session:
-        row = Run(script_id=script_id, status="pending")
+        row = Run(script_id=script_id, project_id=project_id, status="pending")
         session.add(row)
         session.commit()
         session.refresh(row)
@@ -316,6 +652,7 @@ def run_to_record(row: Run):
     tail = "\n".join(log.splitlines()[-50:])
     return RunRecord(
         id=row.id,
+        project_id=row.project_id or DEFAULT_PROJECT,
         script_id=row.script_id,
         status=row.status or "pending",
         log=log,
