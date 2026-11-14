@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
+import re
 from pathlib import Path
 from typing import List, Optional, Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 import db
+import executor
 from ingestion import (
     UPLOAD_DIR,
     CHECKOUT_PATH,
@@ -25,6 +29,8 @@ from models import (
     GenerateTestCasesRequest,
     GenerateTestCasesResponse,
     IngestResponse,
+    RunRecord,
+    RunTestCaseRequest,
     TestCaseRecord,
     TestCaseUpdate,
 )
@@ -187,6 +193,73 @@ def delete_testcase(test_case_id: int):
     """Delete a persisted test case."""
     if not db.delete_test_case(test_case_id):
         raise HTTPException(status_code=404, detail="Test case not found.")
+
+
+def _strip_code_fence(code: str) -> str:
+    """Remove a leading/trailing markdown code fence if Gemini wrapped the script."""
+    text = (code or "").strip()
+    fence = re.search(r"```(?:python)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    if fence:
+        return fence.group(1).strip()
+    return text
+
+
+def _case_to_prompt_text(case) -> str:
+    return (
+        f"{case.feature} - {case.scenario}. "
+        f"Steps: {case.steps or ''}. Expected: {case.expected or ''}"
+    )
+
+
+@app.post("/testcases/{test_case_id}/run", response_model=RunRecord)
+async def run_testcase(test_case_id: int, request: Optional[RunTestCaseRequest] = None):
+    """
+    Execute a test case: generate or accept a Selenium script, persist it,
+    create a runs row, and execute asynchronously in the background.
+    """
+    case = db.get_test_case(test_case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="Test case not found.")
+
+    request = request or RunTestCaseRequest()
+
+    if request.script_code and request.script_code.strip():
+        code = _strip_code_fence(request.script_code)
+        base_url = request.base_url or ""
+    else:
+        generated = generate_selenium_script(
+            _case_to_prompt_text(case),
+            top_k=request.top_k,
+            base_url=request.base_url or "http://localhost:8000/checkout/checkout.html",
+        )
+        code = _strip_code_fence(generated.script)
+        base_url = request.base_url or "http://localhost:8000/checkout/checkout.html"
+
+    script = db.create_script(code=code, test_case_id=test_case_id, base_url=base_url)
+    run = db.create_run(script_id=script.id)
+    asyncio.create_task(executor.execute_run(run.id, script.id))
+    return db.run_to_record(run)
+
+
+@app.get("/runs/{run_id}", response_model=RunRecord)
+def get_run(run_id: int):
+    """Get run status, full log, log tail, and screenshot URL."""
+    row = db.get_run(run_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    return db.run_to_record(row)
+
+
+@app.get("/runs/{run_id}/screenshot")
+def get_run_screenshot(run_id: int):
+    """Serve the screenshot captured for a run."""
+    row = db.get_run(run_id)
+    if row is None or not row.screenshot_path:
+        raise HTTPException(status_code=404, detail="Screenshot not found.")
+    path = (db.STORAGE_DIR / row.screenshot_path).resolve()
+    if not path.exists() or db.STORAGE_DIR.resolve() not in path.parents:
+        raise HTTPException(status_code=404, detail="Screenshot not found.")
+    return FileResponse(path)
 
 
 @app.get("/checkout-html")

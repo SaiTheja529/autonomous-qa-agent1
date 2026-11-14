@@ -80,3 +80,38 @@ class GenerateScriptResponse(BaseModel):
     contexts: List[ContextChunk]
     checkout_excerpt: str
     script: str
+
+
+class RunTestCaseRequest(BaseModel):
+    """Optional overrides for POST /testcases/{id}/run."""
+
+    script_code: Optional[str] = Field(
+        None, description="Script to run; if omitted, one is generated from the test case."
+    )
+    base_url: Optional[str] = Field(None, description="Base URL override for script generation.")
+    top_k: int = Field(5, description="Context chunks to retrieve when generating a script.")
+
+
+class RunRecord(BaseModel):
+    """A persisted test execution run as returned by the API."""
+
+    id: int
+    script_id: Optional[int] = None
+    status: str = "pending"
+    log: str = ""
+    log_tail: str = ""
+    screenshot_path: str = ""
+    screenshot_url: Optional[str] = None
+    healed: bool = False
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+
+
+class ScriptRecord(BaseModel):
+    """A persisted Selenium script version."""
+
+    id: int
+    test_case_id: Optional[int] = None
+    version: int = 1
+    base_url: str = ""
+    created_at: Optional[datetime] = None
