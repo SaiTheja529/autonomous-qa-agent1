@@ -9,7 +9,7 @@ import json
 import logging
 import os
 import re
-from typing import List
+from typing import List, Optional
 
 from fastapi import HTTPException
 
@@ -80,23 +80,44 @@ def _context_block(contexts: List[ContextChunk]) -> str:
     return "\n\n".join(lines)
 
 
-def _generate_with_gemini(client, model: str, prompt: str, temperature: float = 0.2) -> str:
+def _iter_gemini(client, model: str, prompt: str, temperature: float = 0.2):
     """
-    Call Gemini generate_content with a minimal generation config and return text.
+    Stream Gemini generate_content_stream chunks, yielding text deltas.
     """
     try:
-        completion = client.models.generate_content(
+        stream = client.models.generate_content_stream(
             model=model,
             contents=prompt,
             config={"temperature": temperature},
         )
+        for chunk in stream:
+            text = getattr(chunk, "text", None)
+            if text:
+                yield text
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Gemini generation failed: {exc}") from exc
-    # defensive: some clients return different shapes; try to extract text
+
+
+def _generate_with_gemini(client, model: str, prompt: str, temperature: float = 0.2) -> str:
+    """
+    Collect a full Gemini response via streaming and return the text.
+    """
+    return "".join(_iter_gemini(client, model, prompt, temperature=temperature))
+
+
+def _default_top_k() -> int:
+    """Retrieval depth persisted by /ingest, falling back to 5."""
     try:
-        return getattr(completion, "text", "") or completion.get("text", "") or ""
+        value = db.get_setting("top_k")
+        return max(1, int(value)) if value else 5
     except Exception:
-        return ""
+        return 5
+
+
+META_PREFIX = "__META__"
+REVIEW_MARKER = "\n\n--- REVIEW ---\n\n"
 
 
 def _parse_cases_json(content: str) -> List[TestCase]:
@@ -129,11 +150,12 @@ def _parse_cases_json(content: str) -> List[TestCase]:
     return cases
 
 
-def generate_test_cases(query: str, top_k: int = 5) -> GenerateTestCasesResponse:
+def generate_test_cases(query: str, top_k: Optional[int] = None) -> GenerateTestCasesResponse:
     """
     Use retrieved context + Gemini to synthesize structured test cases.
     Generated cases are persisted to the database and returned as records.
     """
+    top_k = top_k or _default_top_k()
     contexts = retrieve_context(query, top_k=top_k)
     if not contexts:
         raise HTTPException(
@@ -187,21 +209,8 @@ Context:
     )
 
 
-def generate_selenium_script(test_case: str, top_k: int = 5, base_url: str = "http://localhost:8000/checkout/checkout.html") -> GenerateScriptResponse:
-    """
-    Generate a runnable Selenium Python script for the provided test case.
-    """
-    contexts = retrieve_context(test_case, top_k=top_k)
-    try:
-        html = load_checkout_html()
-        html_excerpt = load_checkout_excerpt()
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    client = _ensure_genai_client()
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-
-    prompt = f"""
+def _build_script_prompt(test_case: str, contexts: List[ContextChunk], html: str, base_url: str) -> str:
+    return f"""
 You are a senior QA automation engineer writing Selenium (Python) scripts.
 Use the checkout HTML and documentation context to generate an executable script that automates the test case.
 
@@ -237,10 +246,110 @@ Checkout HTML:
 {html}
     """.strip()
 
+
+def _review_prompt(script: str, test_case: str) -> str:
+    return f"""
+You are a senior QA automation reviewer. Critique the Selenium script below for the test case.
+
+Focus on:
+- Selector robustness: brittle XPath/CSS selectors, missing explicit waits, race conditions.
+- Missing assertions: expected results from the test case that are never asserted.
+- Error handling: screenshots on failure, cleanup via driver.quit(), swallowed exceptions.
+- Flakiness: hardcoded sleeps, assumptions about element state or ordering.
+
+Be concise. Output markdown bullets only; do not rewrite the script.
+
+Test Case:
+{test_case}
+
+Script:
+{script}
+    """.strip()
+
+
+def _prepare_script_generation(test_case: str, top_k: Optional[int], base_url: str):
+    """
+    Shared setup for script generation. Returns (contexts, html_excerpt, client, model, prompt).
+    Raises HTTPException eagerly so callers can return proper error responses.
+    """
+    top_k = top_k or _default_top_k()
+    contexts = retrieve_context(test_case, top_k=top_k)
+    try:
+        html = load_checkout_html()
+        html_excerpt = load_checkout_excerpt()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    client = _ensure_genai_client()
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    prompt = _build_script_prompt(test_case, contexts, html, base_url)
+    return contexts, html_excerpt, client, model, prompt
+
+
+def generate_selenium_script(
+    test_case: str,
+    top_k: Optional[int] = None,
+    base_url: str = "http://localhost:8000/checkout/checkout.html",
+    review: bool = False,
+) -> GenerateScriptResponse:
+    """
+    Generate a runnable Selenium Python script for the provided test case.
+    When ``review`` is true, a second Gemini pass critiques the script.
+    """
+    contexts, html_excerpt, client, model, prompt = _prepare_script_generation(
+        test_case, top_k, base_url
+    )
+
     script = _generate_with_gemini(client, model, prompt, temperature=0.2)
+    review_text = ""
+    if review:
+        review_text = _generate_with_gemini(
+            client, model, _review_prompt(script, test_case), temperature=0.4
+        )
     return GenerateScriptResponse(
         test_case=test_case,
         contexts=contexts,
         checkout_excerpt=html_excerpt,
         script=script,
+        review=review_text,
     )
+
+
+def iter_script_stream(
+    test_case: str,
+    top_k: Optional[int] = None,
+    base_url: str = "http://localhost:8000/checkout/checkout.html",
+    review: bool = False,
+):
+    """
+    Prepare a streaming script generation and return an iterator of text chunks.
+
+    The first yielded chunk is a ``__META__<json>`` header line carrying the
+    retrieval contexts and checkout excerpt; subsequent chunks are the script
+    text. When ``review`` is true, a ``--- REVIEW ---`` marker followed by the
+    critique text is appended after the script.
+
+    This is a regular function (not a generator) so setup errors raise
+    HTTPException eagerly, before StreamingResponse begins.
+    """
+    contexts, html_excerpt, client, model, prompt = _prepare_script_generation(
+        test_case, top_k, base_url
+    )
+    meta = {
+        "contexts": [c.model_dump() for c in contexts],
+        "checkout_excerpt": html_excerpt,
+    }
+
+    def _gen():
+        yield META_PREFIX + json.dumps(meta) + "\n"
+        script_parts = []
+        for chunk in _iter_gemini(client, model, prompt, temperature=0.2):
+            script_parts.append(chunk)
+            yield chunk
+        if review:
+            yield REVIEW_MARKER
+            yield from _iter_gemini(
+                client, model, _review_prompt("".join(script_parts), test_case), temperature=0.4
+            )
+
+    return _gen()

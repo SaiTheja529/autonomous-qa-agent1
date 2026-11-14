@@ -193,12 +193,12 @@ def generate_testcases_endpoint(request: GenerateTestCasesRequest):
 
 
 @app.post("/generate-script", response_model=GenerateScriptResponse)
-def generate_script_endpoint(request: GenerateScriptRequest):
+def generate_script_endpoint(request: GenerateScriptRequest, review: bool = False):
     return generate_selenium_script(
         request.test_case,
         top_k=request.top_k,
         base_url=request.base_url,
-        review=request.review,
+        review=request.review or review,
     )
 
 
@@ -278,23 +278,65 @@ _DRIVER_BLOCK_RE = re.compile(
 _REMOTE_ONLY_RE = re.compile(
     r"(?ms)^[ \t]*driver\s*=\s*webdriver\.Remote\([\s\S]*?^[ \t]*\)[ \t]*\n"
 )
-_MAIN_GUARD_RE = re.compile(
-    r'(?ms)^[ \t]*if\s+__name__\s*==\s*["\']__main__["\']\s*:[ \t]*\n(?:[ \t]+[^\n]*\n?)*'
+# Single-line variant: driver = webdriver.Remote(...)
+_REMOTE_INLINE_RE = re.compile(
+    r"(?m)^[ \t]*driver\s*=\s*webdriver\.Remote\([^\n]*\)[ \t]*\n"
 )
-_QUIT_LINE_RE = re.compile(r"(?m)^[ \t]*driver\.quit\(\)[ \t]*$")
+_MAIN_DEF_RE = re.compile(
+    r"(?ms)^[ \t]*def main\(\)\s*:[ \t]*\n(?P<body>(?:[ \t]+[^\n]*\n?|[ \t]*\n)*)"
+)
+_GUARD_RE = re.compile(
+    r"(?ms)^[ \t]*if\s+__name__\s*==\s*[\"']__main__[\"']\s*:[ \t]*\n(?P<body>(?:[ \t]+[^\n]*\n?|[ \t]*\n)*)"
+)
+_QUIT_LINE_RE = re.compile(r"(?m)^([ \t]*)driver\.quit\(\)[ \t]*$")
+
+
+def _dedent_block(block: str, spaces: int = 4) -> str:
+    """Remove up to ``spaces`` leading spaces from each non-empty line."""
+    out = []
+    for line in block.splitlines():
+        if line.strip() and line.startswith(" " * spaces):
+            out.append(line[spaces:])
+        elif line.strip():
+            out.append(line.lstrip())
+        else:
+            out.append("")
+    return "\n".join(out)
 
 
 def _script_body_for_pytest(code: str) -> str:
     """
     Convert a generated standalone script into a function body that uses the
-    ``driver`` pytest fixture: strip the driver bootstrap, main guard, and
-    trailing driver.quit() calls.
+    ``driver`` pytest fixture: strip the driver bootstrap, inline ``main()``
+    and the ``__main__`` guard, and neutralize ``driver.quit()`` calls (the
+    fixture handles teardown).
     """
     text = _strip_code_fence(code or "")
     text = _DRIVER_BLOCK_RE.sub("", text)
     text = _REMOTE_ONLY_RE.sub("", text)
-    text = _MAIN_GUARD_RE.sub("", text)
-    text = _QUIT_LINE_RE.sub("    pass", text)
+    text = _REMOTE_INLINE_RE.sub("", text)
+
+    main_def = _MAIN_DEF_RE.search(text)
+    if main_def:
+        inlined = _dedent_block(main_def.group("body"))
+        text = text[: main_def.start()] + inlined + "\n" + text[main_def.end() :]
+
+    guard = _GUARD_RE.search(text)
+    if guard:
+        calls = [
+            ln.strip()
+            for ln in guard.group("body").splitlines()
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        if calls == ["main()"] and main_def:
+            replacement = ""  # main() body was already inlined above
+        elif calls == ["main()"]:
+            replacement = ""  # nothing else to run; avoid a NameError
+        else:
+            replacement = _dedent_block(guard.group("body"))
+        text = text[: guard.start()] + replacement + text[guard.end() :]
+
+    text = _QUIT_LINE_RE.sub(r"\1pass", text)
     return text.strip("\n")
 
 
