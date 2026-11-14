@@ -9,6 +9,8 @@ __pycache__/
 # Databases / Vector Stores
 *.sqlite3
 *.bin
+*.db
+*.db-journal
 
 # Frontend
 node_modules/

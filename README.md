@@ -6,16 +6,18 @@ An end-to-end QA assistant that ingests project documentation and checkout HTML,
 - FastAPI + Uvicorn for the API
 - Streamlit for the UI
 - ChromaDB + sentence-transformers for embeddings and retrieval
-- OpenAI chat models for generation (set `OPENAI_API_KEY`)
+- Google Gemini (`google-genai`) for generation (set `GEMINI_API_KEY`)
+- SQLAlchemy + SQLite for persistence (documents, test cases, scripts, runs)
 - Selenium 4 for emitted scripts
 
 ## Repository Layout
 - `backend/` — FastAPI app, ingestion + RAG utilities, checkout asset
-  - `main.py` (API), `ingestion.py` (parsing/chunking/embeddings), `rag.py` (LLM calls), `models.py` (Pydantic)
+  - `main.py` (API), `ingestion.py` (parsing/chunking/embeddings), `rag.py` (LLM calls), `models.py` (Pydantic), `db.py` (SQLite persistence)
   - `checkout/checkout.html` — sample target UI
-  - `storage/` — Chroma persistence + uploaded docs (created at runtime)
+  - `storage/` — Chroma persistence + uploaded docs + `app.db` SQLite database (created at runtime)
 - `frontend/app.py` — Streamlit UI
 - `support_docs/` — Example documents used to seed the knowledge base
+- `docs/ROADMAP.md` — multi-phase feature roadmap and status
 - `requirements.txt` — Python dependencies
 
 ## Setup
@@ -29,6 +31,7 @@ pip install -r requirements.txt
 - `GEMINI_MODEL` (optional, default `gemini-2.5-flash`)
 - `EMBEDDING_MODEL` (optional, default `all-MiniLM-L6-v2`)
 - `BACKEND_URL` (optional for Streamlit, default `http://localhost:8000`)
+- `DATABASE_URL` (optional, default `sqlite:///backend/storage/app.db`)
 
 ## Running
 Open two terminals:
@@ -42,15 +45,18 @@ streamlit run frontend/app.py
 
 ## Usage Flow
 1. In Streamlit, upload support docs (MD/TXT/JSON/PDF) and the `checkout.html` file, then click **Build Knowledge Base** (optionally reset existing vectors).  
-2. Enter a request such as “Generate positive and negative test cases for the discount code feature.” Click **Generate Test Cases** to get a Markdown table grounded in the uploaded docs.  
-3. Select a test case from the rendered table (or paste one manually) and click **Generate Selenium Script**. The backend fetches the checkout HTML + context and returns a runnable Python Selenium script.  
+2. Enter a request such as “Generate positive and negative test cases for the discount code feature.” Click **Generate Test Cases** to get structured test cases (JSON) grounded in the uploaded docs. Generated cases are persisted to SQLite and shown as a selectable table.  
+3. On the **Test Cases** page you can also load previously saved cases, filter by status, update status, or delete them. On **Selenium Scripts**, select a persisted test case (or paste one manually) and click **Generate Selenium Script**. The backend fetches the checkout HTML + context and returns a runnable Python Selenium script.  
 4. Copy the script and run it against a served copy of `backend/checkout/checkout.html` (adjust `base_url` inside the script as needed).
 
 ## API Quick Reference
 - `GET /health` — status check  
 - `POST /ingest` — multipart upload (`docs` files[], optional `checkout`), form field `reset` (bool)  
 - `POST /generate-testcases` — JSON `{ "query": str, "top_k": int }`  
-- `POST /generate-script` — JSON `{ "test_case": str, "top_k": int }`  
+- `POST /generate-script` — JSON `{ "test_case": str, "top_k": int, "base_url": str }`  
+- `GET /testcases` — list persisted test cases (optional `?status=` filter)  
+- `PATCH /testcases/{id}` — partially update a test case (`feature`, `scenario`, `steps`, `expected`, `grounded_in`, `status`)  
+- `DELETE /testcases/{id}` — delete a test case  
 - `GET /checkout-html` — returns stored checkout HTML
 
 ## Provided Assets
@@ -60,6 +66,6 @@ streamlit run frontend/app.py
 - `backend/checkout/checkout.html` — target E-Shop checkout page (products, cart, discount, validation, payment success messaging)
 
 ## Notes
-- The backend persists vectors under `backend/storage/vector_store`. Use the “Reset” option in the UI to rebuild from scratch.
+- The backend persists vectors under `backend/storage/vector_store` and relational data in `backend/storage/app.db` (SQLite). Use the “Reset” option in the UI to rebuild vectors from scratch; test cases can be managed via the API/UI.
 - If you run offline, ensure the embedding model is cached locally or swap `EMBEDDING_MODEL` to one you have available.
 - No automated tests are included; run a manual smoke test by ingesting the bundled support docs + checkout HTML and generating one test case and script.

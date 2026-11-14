@@ -44,29 +44,38 @@ def generate_script(test_case: str, top_k: int, base_url: str):
     return resp.json()
 
 
-def parse_markdown_table(md: str):
-    """
-    Parse simple Markdown table rows into dictionaries so the user can pick a case.
-    """
-    rows = []
-    for line in md.splitlines():
-        if not line.strip().startswith("|"):
-            continue
-        if set(line.strip()) <= {"|", "-"}:
-            continue  # skip separator rows
-        parts = [p.strip() for p in line.split("|") if p.strip()]
-        if len(parts) < 5:
-            continue
-        rows.append(
-            {
-                "id": parts[0],
-                "feature": parts[1],
-                "scenario": parts[2],
-                "steps": parts[3] if len(parts) > 3 else "",
-                "expected": parts[4] if len(parts) > 4 else "",
-            }
-        )
-    return rows
+def get_test_cases(status: Optional[str] = None):
+    params = {}
+    if status:
+        params["status"] = status
+    resp = requests.get(f"{BACKEND_URL}/testcases", params=params, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def update_test_case(test_case_id: int, fields: dict):
+    resp = requests.patch(f"{BACKEND_URL}/testcases/{test_case_id}", json=fields, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def delete_test_case(test_case_id: int):
+    resp = requests.delete(f"{BACKEND_URL}/testcases/{test_case_id}", timeout=30)
+    resp.raise_for_status()
+    return resp.status_code
+
+
+def case_label(case: dict) -> str:
+    cid = case.get("id")
+    scenario = case.get("scenario", "")
+    return f"#{cid}: {scenario}" if cid is not None else scenario
+
+
+def case_to_text(case: dict) -> str:
+    return (
+        f"{case.get('feature', '')} - {case.get('scenario', '')}. "
+        f"Steps: {case.get('steps', '')}. Expected: {case.get('expected', '')}"
+    )
 
 
 st.set_page_config(page_title="Autonomous QA Agent", layout="wide")
@@ -226,9 +235,10 @@ elif page == "cases":
             with st.spinner("Generating test cases..."):
                 try:
                     result = generate_test_cases(query, top_k)
-                    st.session_state["last_test_cases"] = result["test_cases"]
+                    st.session_state["last_test_cases"] = result.get("cases", [])
                     st.session_state["last_contexts"] = result["contexts"]
-                    st.success("Test cases generated and cached.")
+                    st.session_state["saved_cases"] = None
+                    st.success("Test cases generated and saved to the database.")
                 except Exception as exc:
                     st.error(f"Failed to generate test cases: {exc}")
 
@@ -236,16 +246,75 @@ elif page == "cases":
         last_cases = st.session_state.get("last_test_cases")
         last_contexts = st.session_state.get("last_contexts", [])
         if last_cases:
-            parsed_rows = parse_markdown_table(last_cases)
-            if parsed_rows:
-                df = pd.DataFrame(parsed_rows)
-                st.dataframe(df, use_container_width=True, hide_index=True)
-            st.markdown(last_cases)
+            df = pd.DataFrame(last_cases)
+            if "created_at" in df.columns:
+                df = df.drop(columns=["created_at"])
+            st.dataframe(df, use_container_width=True, hide_index=True)
             if last_contexts:
                 with st.expander("Retrieved context (last run)"):
                     for ctx in last_contexts:
                         st.markdown(f"**{ctx['source']}** — `{ctx['chunk_id']}`")
                         st.write(ctx["text"])
+
+        # --- Saved test case management ---
+        st.markdown("#### Saved test cases")
+        col_load, col_status_filter = st.columns([1, 1])
+        with col_load:
+            if st.button("Load saved test cases", use_container_width=True):
+                try:
+                    st.session_state["saved_cases"] = get_test_cases()
+                except Exception as exc:
+                    st.error(f"Failed to load test cases: {exc}")
+        with col_status_filter:
+            status_filter = st.selectbox(
+                "Filter by status",
+                options=["", "active", "draft", "archived"],
+                format_func=lambda s: s or "all",
+                key="cases_status_filter",
+            )
+            if st.button("Apply filter", use_container_width=True):
+                try:
+                    st.session_state["saved_cases"] = get_test_cases(status=status_filter or None)
+                except Exception as exc:
+                    st.error(f"Failed to load test cases: {exc}")
+
+        saved_cases = st.session_state.get("saved_cases")
+        if saved_cases:
+            sdf = pd.DataFrame(saved_cases)
+            if "created_at" in sdf.columns:
+                sdf = sdf.drop(columns=["created_at"])
+            st.dataframe(sdf, use_container_width=True, hide_index=True)
+
+            edit_col, status_col, btn_col = st.columns([2, 1, 1])
+            with edit_col:
+                edit_options = [case_label(c) for c in saved_cases]
+                edit_choice = st.selectbox("Select a case to manage", edit_options, key="cases_manage_select")
+            selected = saved_cases[edit_options.index(edit_choice)] if edit_options else None
+            if selected:
+                with status_col:
+                    new_status = st.selectbox(
+                        "Status",
+                        options=["active", "draft", "archived"],
+                        index=["active", "draft", "archived"].index(selected.get("status", "active"))
+                        if selected.get("status", "active") in ["active", "draft", "archived"]
+                        else 0,
+                        key="cases_status_select",
+                    )
+                with btn_col:
+                    if st.button("Save status", use_container_width=True):
+                        try:
+                            update_test_case(selected["id"], {"status": new_status})
+                            st.session_state["saved_cases"] = get_test_cases(status=status_filter or None)
+                            st.success(f"Test case #{selected['id']} updated.")
+                        except Exception as exc:
+                            st.error(f"Update failed: {exc}")
+                    if st.button("Delete", use_container_width=True):
+                        try:
+                            delete_test_case(selected["id"])
+                            st.session_state["saved_cases"] = get_test_cases(status=status_filter or None)
+                            st.success(f"Test case #{selected['id']} deleted.")
+                        except Exception as exc:
+                            st.error(f"Delete failed: {exc}")
         st.markdown('</div>', unsafe_allow_html=True)
 
 # --- Selenium Scripts Page ---
@@ -253,18 +322,26 @@ elif page == "scripts":
     st.markdown("### 🛠️ Generate Selenium Script")
     with st.container():
         st.markdown('<div class="glass">', unsafe_allow_html=True)
-        last_cases = st.session_state.get("last_test_cases", "")
-        parsed_rows = parse_markdown_table(last_cases) if last_cases else []
+        # Collect selectable test cases: persisted saved cases first, then last generated batch
+        candidate_cases: List[dict] = []
+        saved_cases = st.session_state.get("saved_cases") or []
+        last_cases = st.session_state.get("last_test_cases") or []
+        seen_ids = set()
+        for c in list(saved_cases) + list(last_cases):
+            if not isinstance(c, dict):
+                continue
+            key = c.get("id")
+            if key is not None:
+                if key in seen_ids:
+                    continue
+                seen_ids.add(key)
+            candidate_cases.append(c)
 
         selected_case_text = ""
-        if parsed_rows:
-            options = [f"{row['id']}: {row['scenario']}" for row in parsed_rows]
-            choice = st.selectbox("Select a test case from the table above", options)
-            selected_row = parsed_rows[options.index(choice)]
-            selected_case_text = (
-                f"{selected_row['id']} - {selected_row['feature']} - {selected_row['scenario']}. "
-                f"Steps: {selected_row['steps']}. Expected: {selected_row['expected']}"
-            )
+        if candidate_cases:
+            options = [case_label(c) for c in candidate_cases]
+            choice = st.selectbox("Select a test case", options, key="scripts_case_select")
+            selected_case_text = case_to_text(candidate_cases[options.index(choice)])
 
         manual_input = st.text_area(
             "Or paste a test case description to automate",

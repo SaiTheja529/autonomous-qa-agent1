@@ -5,13 +5,24 @@ Now powered by Gemini via google-genai (optional).
 """
 from __future__ import annotations
 
+import json
+import logging
 import os
+import re
 from typing import List
 
 from fastapi import HTTPException
 
+import db
 from ingestion import get_collection, load_checkout_excerpt, load_checkout_html
-from models import ContextChunk, GenerateScriptResponse, GenerateTestCasesResponse
+from models import (
+    ContextChunk,
+    GenerateScriptResponse,
+    GenerateTestCasesResponse,
+    TestCase,
+)
+
+logger = logging.getLogger("uvicorn.error")
 
 
 def _ensure_genai_client():
@@ -88,9 +99,40 @@ def _generate_with_gemini(client, model: str, prompt: str, temperature: float = 
         return ""
 
 
+def _parse_cases_json(content: str) -> List[TestCase]:
+    """
+    Extract a JSON array of test cases from a Gemini response.
+    Tolerates markdown code fences and surrounding prose.
+    """
+    text = (content or "").strip()
+    if not text:
+        return []
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    if fence:
+        text = fence.group(1).strip()
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1 or end <= start:
+        return []
+    try:
+        data = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        logger.warning("Failed to parse Gemini test case JSON: %.200s", text)
+        return []
+    cases: List[TestCase] = []
+    if isinstance(data, list):
+        for item in data:
+            try:
+                cases.append(TestCase(**item))
+            except Exception:
+                logger.warning("Skipping malformed test case entry: %r", item)
+    return cases
+
+
 def generate_test_cases(query: str, top_k: int = 5) -> GenerateTestCasesResponse:
     """
     Use retrieved context + Gemini to synthesize structured test cases.
+    Generated cases are persisted to the database and returned as records.
     """
     contexts = retrieve_context(query, top_k=top_k)
     if not contexts:
@@ -103,9 +145,11 @@ def generate_test_cases(query: str, top_k: int = 5) -> GenerateTestCasesResponse
     model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
     prompt = f"""
 You are a QA test designer. Using only the provided context, create concise, structured test cases for the request below.
-- Use Markdown table with columns: Test_ID, Feature, Test_Scenario, Steps, Expected_Result, Grounded_In.
+- Respond with ONLY a JSON array (no markdown, no prose). Each element must be an object with keys:
+  "feature" (string), "scenario" (string), "steps" (string, semicolon-separated steps),
+  "expected" (string), "grounded_in" (string, brief citation of the source document name).
 - Include both positive and negative cases where relevant.
-- Ground every Expected_Result with a brief citation from the source document name.
+- Ground every Expected result with a brief citation from the source document name.
 - Do not invent features; rely strictly on context.
 
 User Request:
@@ -116,10 +160,30 @@ Context:
     """.strip()
 
     content = _generate_with_gemini(client, model, prompt, temperature=0.2)
+
+    cases = _parse_cases_json(content)
+    records = []
+    for case in cases:
+        try:
+            row = db.create_test_case(
+                feature=case.feature,
+                scenario=case.scenario,
+                steps=case.steps,
+                expected=case.expected,
+                grounded_in=case.grounded_in,
+            )
+            records.append(db.test_case_to_record(row))
+        except Exception as exc:
+            logger.exception("Failed to persist generated test case: %s", exc)
+
+    if not records:
+        logger.warning("Gemini returned no parseable test cases for query: %s", query)
+
     return GenerateTestCasesResponse(
         query=query,
         contexts=contexts,
         test_cases=content,
+        cases=records,
     )
 
 

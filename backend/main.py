@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -9,6 +10,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+import db
 from ingestion import (
     UPLOAD_DIR,
     CHECKOUT_PATH,
@@ -23,6 +25,8 @@ from models import (
     GenerateTestCasesRequest,
     GenerateTestCasesResponse,
     IngestResponse,
+    TestCaseRecord,
+    TestCaseUpdate,
 )
 from rag import generate_selenium_script, generate_test_cases
 
@@ -90,6 +94,11 @@ def _normalize_ingest_result(result: Any) -> dict:
     return out
 
 
+@app.on_event("startup")
+def _startup() -> None:
+    db.init_db()
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -112,9 +121,14 @@ async def ingest_endpoint(
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     saved_paths: List[Path] = []
     for file in docs:
+        content = await file.read()
         dest = UPLOAD_DIR / file.filename
-        dest.write_bytes(await file.read())
+        dest.write_bytes(content)
         saved_paths.append(dest)
+        try:
+            db.upsert_document(file.filename, hashlib.sha256(content).hexdigest())
+        except Exception as exc:
+            logger.warning("Failed to record document %s in DB: %s", file.filename, exc)
 
     html_saved = False
     if checkout:
@@ -151,6 +165,28 @@ def generate_script_endpoint(request: GenerateScriptRequest):
         top_k=request.top_k,
         base_url=request.base_url,
     )
+
+
+@app.get("/testcases", response_model=List[TestCaseRecord])
+def list_testcases(status: Optional[str] = None):
+    """List persisted test cases, optionally filtered by status."""
+    return [db.test_case_to_record(row) for row in db.list_test_cases(status=status)]
+
+
+@app.patch("/testcases/{test_case_id}", response_model=TestCaseRecord)
+def patch_testcase(test_case_id: int, update: TestCaseUpdate):
+    """Partially update a persisted test case."""
+    row = db.update_test_case(test_case_id, update.model_dump(exclude_unset=True))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Test case not found.")
+    return db.test_case_to_record(row)
+
+
+@app.delete("/testcases/{test_case_id}", status_code=204)
+def delete_testcase(test_case_id: int):
+    """Delete a persisted test case."""
+    if not db.delete_test_case(test_case_id):
+        raise HTTPException(status_code=404, detail="Test case not found.")
 
 
 @app.get("/checkout-html")
