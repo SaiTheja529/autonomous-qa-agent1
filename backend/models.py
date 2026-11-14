@@ -18,11 +18,13 @@ class IngestResponse(BaseModel):
     chunks_added: int
     sources: List[str] = Field(default_factory=list)
     html_saved: bool
+    changed_docs: List[str] = Field(default_factory=list)
+    stale_marked: int = 0
 
 
 class GenerateTestCasesRequest(BaseModel):
     query: str = Field(..., description="User prompt describing which test cases to generate")
-    top_k: int = Field(5, description="How many context chunks to retrieve")
+    top_k: Optional[int] = Field(None, description="How many context chunks to retrieve (defaults to the value set via /ingest)")
 
 
 class TestCase(BaseModel):
@@ -68,11 +70,12 @@ class GenerateTestCasesResponse(BaseModel):
 
 class GenerateScriptRequest(BaseModel):
     test_case: str = Field(..., description="Single test case description to automate")
-    top_k: int = Field(5, description="How many context chunks to retrieve")
+    top_k: Optional[int] = Field(None, description="How many context chunks to retrieve (defaults to the value set via /ingest)")
     base_url: str = Field(
         "http://localhost:8000/checkout/checkout.html",
         description="Base URL where checkout.html is served",
     )
+    review: bool = Field(False, description="Run a second Gemini pass critiquing selector robustness and missing assertions")
 
 
 class GenerateScriptResponse(BaseModel):
@@ -80,6 +83,7 @@ class GenerateScriptResponse(BaseModel):
     contexts: List[ContextChunk]
     checkout_excerpt: str
     script: str
+    review: str = ""
 
 
 class RunTestCaseRequest(BaseModel):
@@ -89,7 +93,7 @@ class RunTestCaseRequest(BaseModel):
         None, description="Script to run; if omitted, one is generated from the test case."
     )
     base_url: Optional[str] = Field(None, description="Base URL override for script generation.")
-    top_k: int = Field(5, description="Context chunks to retrieve when generating a script.")
+    top_k: Optional[int] = Field(None, description="Context chunks to retrieve when generating a script.")
 
 
 class RunRecord(BaseModel):
@@ -105,6 +109,36 @@ class RunRecord(BaseModel):
     healed: bool = False
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
+
+
+class CoverageTestCase(BaseModel):
+    """A test case that covers (is grounded in) a document."""
+
+    id: int
+    feature: str
+    scenario: str
+    grounded_in: str = ""
+    status: str = "active"
+
+
+class CoverageDocument(BaseModel):
+    """A document's coverage status and the test cases covering it."""
+
+    id: int
+    filename: str
+    sha256: str
+    ingested_at: Optional[datetime] = None
+    status: str = "uncovered"
+    test_cases: List[CoverageTestCase] = Field(default_factory=list)
+
+
+class CoverageResponse(BaseModel):
+    """Coverage/traceability matrix: documents x covering test cases."""
+
+    documents: List[CoverageDocument] = Field(default_factory=list)
+    total_documents: int = 0
+    covered_documents: int = 0
+    uncovered_documents: int = 0
 
 
 class ScriptRecord(BaseModel):

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import hashlib
+import io
 import json
 import logging
 import re
@@ -10,7 +12,7 @@ from typing import List, Optional, Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import db
@@ -24,6 +26,9 @@ from ingestion import (
     load_checkout_html,
 )
 from models import (
+    CoverageDocument,
+    CoverageResponse,
+    CoverageTestCase,
     GenerateScriptRequest,
     GenerateScriptResponse,
     GenerateTestCasesRequest,
@@ -34,7 +39,7 @@ from models import (
     TestCaseRecord,
     TestCaseUpdate,
 )
-from rag import generate_selenium_script, generate_test_cases
+from rag import generate_selenium_script, generate_test_cases, iter_script_stream
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -115,6 +120,9 @@ async def ingest_endpoint(
     reset: bool = Form(False),
     docs: List[UploadFile] = File(default_factory=list),
     checkout: Optional[UploadFile] = File(None),
+    chunk_size: int = Form(800),
+    overlap: int = Form(150),
+    top_k: int = Form(5),
 ):
     """
     Upload support docs + checkout HTML and build the knowledge base.
@@ -126,13 +134,18 @@ async def ingest_endpoint(
 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     saved_paths: List[Path] = []
+    changed_docs: List[str] = []
     for file in docs:
         content = await file.read()
         dest = UPLOAD_DIR / file.filename
         dest.write_bytes(content)
         saved_paths.append(dest)
         try:
-            db.upsert_document(file.filename, hashlib.sha256(content).hexdigest())
+            sha = hashlib.sha256(content).hexdigest()
+            existing = db.get_document(file.filename)
+            if existing is not None and existing.sha256 != sha:
+                changed_docs.append(file.filename)
+            db.upsert_document(file.filename, sha)
         except Exception as exc:
             logger.warning("Failed to record document %s in DB: %s", file.filename, exc)
 
@@ -144,18 +157,33 @@ async def ingest_endpoint(
 
     # Call existing ingest_files (could return object or dict)
     try:
-        result = ingest_files(saved_paths, reset=reset)
+        result = ingest_files(
+            saved_paths,
+            reset=reset,
+            chunk_size=chunk_size,
+            overlap=overlap,
+            top_k=top_k,
+        )
     except Exception as exc:
         logger.exception("Ingestion failed (exception in ingest_files): %s", exc)
         raise HTTPException(status_code=500, detail=f"Ingestion error: {exc}")
 
     norm = _normalize_ingest_result(result)
 
+    stale_marked = 0
+    if changed_docs:
+        try:
+            stale_marked = db.mark_test_cases_stale(changed_docs)
+        except Exception as exc:
+            logger.warning("Failed to mark stale test cases: %s", exc)
+
     return IngestResponse(
         docs_ingested=norm["docs_ingested"],
         chunks_added=norm["chunks_added"],
         sources=norm["sources"],
         html_saved=html_saved,
+        changed_docs=changed_docs,
+        stale_marked=stale_marked,
     )
 
 
@@ -170,7 +198,25 @@ def generate_script_endpoint(request: GenerateScriptRequest):
         request.test_case,
         top_k=request.top_k,
         base_url=request.base_url,
+        review=request.review,
     )
+
+
+@app.post("/generate-script/stream")
+def generate_script_stream_endpoint(request: GenerateScriptRequest):
+    """
+    Stream a Selenium script (and optional review) as plain text.
+
+    First chunk is a ``__META__<json>`` header line with contexts/excerpt;
+    script chunks follow, then a ``--- REVIEW ---`` section when review=true.
+    """
+    stream = iter_script_stream(
+        request.test_case,
+        top_k=request.top_k,
+        base_url=request.base_url,
+        review=request.review,
+    )
+    return StreamingResponse(stream, media_type="text/plain; charset=utf-8")
 
 
 @app.get("/testcases", response_model=List[TestCaseRecord])
@@ -193,6 +239,119 @@ def delete_testcase(test_case_id: int):
     """Delete a persisted test case."""
     if not db.delete_test_case(test_case_id):
         raise HTTPException(status_code=404, detail="Test case not found.")
+
+
+# --- Test case export ----------------------------------------------------
+
+_CSV_FIELDS = ["id", "feature", "scenario", "steps", "expected", "grounded_in", "status", "created_at"]
+
+_PYTEST_HEADER = '''"""Auto-generated pytest suite for autonomous QA test cases."""
+import os
+
+import pytest
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+
+
+@pytest.fixture
+def driver():
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    driver = webdriver.Remote(
+        command_executor=os.environ.get("REMOTE_WEBDRIVER_URL", "http://localhost:4444/wd/hub"),
+        options=options,
+    )
+    yield driver
+    driver.quit()
+
+'''
+
+# Matches the standard driver/options bootstrap block emitted by the generator.
+_DRIVER_BLOCK_RE = re.compile(
+    r"(?ms)^[ \t]*options\s*=\s*Options\(\)[ \t]*\n"
+    r"(?:[ \t]*options\.add_argument\([^\n]*\)[ \t]*\n)*"
+    r"[ \t]*driver\s*=\s*webdriver\.Remote\([\s\S]*?^[ \t]*\)[ \t]*\n"
+)
+# Fallback: remove just the webdriver.Remote(...) assignment.
+_REMOTE_ONLY_RE = re.compile(
+    r"(?ms)^[ \t]*driver\s*=\s*webdriver\.Remote\([\s\S]*?^[ \t]*\)[ \t]*\n"
+)
+_MAIN_GUARD_RE = re.compile(
+    r'(?ms)^[ \t]*if\s+__name__\s*==\s*["\']__main__["\']\s*:[ \t]*\n(?:[ \t]+[^\n]*\n?)*'
+)
+_QUIT_LINE_RE = re.compile(r"(?m)^[ \t]*driver\.quit\(\)[ \t]*$")
+
+
+def _script_body_for_pytest(code: str) -> str:
+    """
+    Convert a generated standalone script into a function body that uses the
+    ``driver`` pytest fixture: strip the driver bootstrap, main guard, and
+    trailing driver.quit() calls.
+    """
+    text = _strip_code_fence(code or "")
+    text = _DRIVER_BLOCK_RE.sub("", text)
+    text = _REMOTE_ONLY_RE.sub("", text)
+    text = _MAIN_GUARD_RE.sub("", text)
+    text = _QUIT_LINE_RE.sub("    pass", text)
+    return text.strip("\n")
+
+
+def _build_pytest_export(cases: List) -> str:
+    parts = [_PYTEST_HEADER]
+    for case in cases:
+        func_name = f"test_case_{case.id}"
+        doc = (case.scenario or "").replace('"""', "'''").strip()
+        parts.append(f'\n\ndef {func_name}(driver):\n    """{doc}"""\n')
+        script = db.get_latest_script_for_test_case(case.id)
+        body = _script_body_for_pytest(script.code) if script else ""
+        if not body:
+            parts.append("    pytest.skip('No Selenium script available for this test case')\n")
+            continue
+        for line in body.splitlines():
+            parts.append(f"    {line}\n" if line.strip() else "\n")
+    return "".join(parts)
+
+
+def _build_csv_export(cases: List) -> str:
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=_CSV_FIELDS)
+    writer.writeheader()
+    for case in cases:
+        writer.writerow(
+            {
+                "id": case.id,
+                "feature": case.feature,
+                "scenario": case.scenario,
+                "steps": case.steps or "",
+                "expected": case.expected or "",
+                "grounded_in": case.grounded_in or "",
+                "status": case.status or "",
+                "created_at": case.created_at.isoformat() if case.created_at else "",
+            }
+        )
+    return buf.getvalue()
+
+
+@app.get("/testcases/export")
+def export_testcases(format: str = "csv"):
+    """Export test cases as CSV or a runnable pytest suite."""
+    fmt = (format or "csv").lower()
+    if fmt not in {"csv", "pytest"}:
+        raise HTTPException(status_code=400, detail="format must be 'csv' or 'pytest'.")
+    cases = db.list_test_cases()
+    if fmt == "csv":
+        return Response(
+            content=_build_csv_export(cases),
+            media_type="text/csv",
+            headers={"Content-Disposition": 'attachment; filename="testcases.csv"'},
+        )
+    return Response(
+        content=_build_pytest_export(cases),
+        media_type="text/x-python",
+        headers={"Content-Disposition": 'attachment; filename="testcases_pytest.py"'},
+    )
 
 
 def _strip_code_fence(code: str) -> str:
@@ -260,6 +419,46 @@ def get_run_screenshot(run_id: int):
     if not path.exists() or db.STORAGE_DIR.resolve() not in path.parents:
         raise HTTPException(status_code=404, detail="Screenshot not found.")
     return FileResponse(path)
+
+
+@app.get("/coverage", response_model=CoverageResponse)
+def coverage():
+    """
+    Coverage/traceability matrix: for each ingested document, report whether
+    any test case is grounded in it (via test_cases.grounded_in) and list the
+    covering test cases.
+    """
+    report = db.get_coverage_report()
+    documents: List[CoverageDocument] = []
+    for entry in report:
+        doc = entry["document"]
+        cases = [
+            CoverageTestCase(
+                id=c["id"],
+                feature=c["feature"],
+                scenario=c["scenario"],
+                grounded_in=c["grounded_in"],
+                status=c["status"],
+            )
+            for c in entry["test_cases"]
+        ]
+        documents.append(
+            CoverageDocument(
+                id=doc["id"],
+                filename=doc["filename"],
+                sha256=doc["sha256"],
+                ingested_at=doc["ingested_at"],
+                status="covered" if cases else "uncovered",
+                test_cases=cases,
+            )
+        )
+    covered = sum(1 for d in documents if d.status == "covered")
+    return CoverageResponse(
+        documents=documents,
+        total_documents=len(documents),
+        covered_documents=covered,
+        uncovered_documents=len(documents) - covered,
+    )
 
 
 @app.get("/checkout-html")

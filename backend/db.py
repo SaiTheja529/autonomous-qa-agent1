@@ -83,6 +83,13 @@ class Script(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class Setting(Base):
+    __tablename__ = "settings"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="")
+
+
 class Run(Base):
     __tablename__ = "runs"
 
@@ -135,6 +142,91 @@ def upsert_document(filename: str, sha256: str) -> Document:
         session.commit()
         session.refresh(doc)
         return doc
+
+
+def get_document(filename: str) -> Optional[Document]:
+    """Fetch a document row by filename, or None if it has never been ingested."""
+    ensure_db()
+    with SessionLocal() as session:
+        return session.scalar(select(Document).where(Document.filename == filename))
+
+
+def _doc_matches_grounded_in(filename: str, grounded_in: str) -> bool:
+    """
+    A test case is grounded in a document when its grounded_in citation
+    mentions the document filename (or its stem, e.g. "product_specs").
+    Matching is case-insensitive substring-based since grounded_in is free text.
+    """
+    grounded = (grounded_in or "").lower()
+    if not grounded:
+        return False
+    name = filename.lower()
+    stem = name.rsplit(".", 1)[0]
+    return name in grounded or (len(stem) >= 4 and stem in grounded)
+
+
+def get_coverage_report() -> list[dict]:
+    """
+    Build a per-document coverage report.
+
+    Returns a list of dicts:
+      {
+        "document": {"id", "filename", "sha256", "ingested_at"},
+        "test_cases": [ {"id", "feature", "scenario", "grounded_in", "status"}, ... ],
+      }
+    where test_cases are those whose grounded_in cites the document.
+    """
+    ensure_db()
+    with SessionLocal() as session:
+        docs = list(session.scalars(select(Document).order_by(Document.filename)))
+        cases = list(session.scalars(select(TestCaseRow).order_by(TestCaseRow.id)))
+
+    report = []
+    for doc in docs:
+        covering = [
+            {
+                "id": case.id,
+                "feature": case.feature,
+                "scenario": case.scenario,
+                "grounded_in": case.grounded_in or "",
+                "status": case.status or "active",
+            }
+            for case in cases
+            if _doc_matches_grounded_in(doc.filename, case.grounded_in or "")
+        ]
+        report.append(
+            {
+                "document": {
+                    "id": doc.id,
+                    "filename": doc.filename,
+                    "sha256": doc.sha256,
+                    "ingested_at": doc.ingested_at,
+                },
+                "test_cases": covering,
+            }
+        )
+    return report
+
+
+# --- Settings helpers ---------------------------------------------------
+
+def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    ensure_db()
+    with SessionLocal() as session:
+        row = session.get(Setting, key)
+        return row.value if row is not None else default
+
+
+def set_setting(key: str, value: str) -> None:
+    ensure_db()
+    with SessionLocal() as session:
+        row = session.get(Setting, key)
+        if row is None:
+            row = Setting(key=key, value=value)
+            session.add(row)
+        else:
+            row.value = value
+        session.commit()
 
 
 # --- Test case helpers -------------------------------------------------
@@ -193,6 +285,26 @@ def update_test_case(test_case_id: int, fields: dict) -> Optional[TestCaseRow]:
         session.commit()
         session.refresh(row)
         return row
+
+
+def mark_test_cases_stale(filenames: list[str]) -> int:
+    """
+    Mark test cases whose grounded_in references any of the given source
+    filenames as status='stale'. Returns the number of rows updated.
+    """
+    if not filenames:
+        return 0
+    ensure_db()
+    count = 0
+    with SessionLocal() as session:
+        rows = session.scalars(select(TestCaseRow).where(TestCaseRow.status != "stale"))
+        for row in rows:
+            grounded = row.grounded_in or ""
+            if any(_doc_matches_grounded_in(name, grounded) for name in filenames):
+                row.status = "stale"
+                count += 1
+        session.commit()
+    return count
 
 
 def delete_test_case(test_case_id: int) -> bool:

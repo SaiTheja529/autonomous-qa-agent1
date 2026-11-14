@@ -4,6 +4,7 @@ Utilities to ingest support documents and build a Chroma vector store.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import uuid
@@ -221,9 +222,18 @@ def save_checkout_html(content: bytes, filename: str = "checkout.html") -> Path:
     return CHECKOUT_PATH
 
 
-def ingest_files(file_paths: Iterable[Path], reset: bool = False) -> IngestResult:
+def ingest_files(
+    file_paths: Iterable[Path],
+    reset: bool = False,
+    chunk_size: int = 800,
+    overlap: int = 150,
+    top_k: Optional[int] = None,
+) -> IngestResult:
     """
     Ingests a list of files into Chroma, chunking content and attaching metadata.
+
+    ``chunk_size``/``overlap`` control the text splitter; ``top_k`` (when
+    provided) is persisted as the default retrieval depth for generation.
     """
     collection = get_collection(reset=reset)
     docs_ingested = 0
@@ -232,7 +242,7 @@ def ingest_files(file_paths: Iterable[Path], reset: bool = False) -> IngestResul
 
     for path in file_paths:
         text = _extract_text(path)
-        chunks = _chunk_text(text)
+        chunks = _chunk_text(text, chunk_size=chunk_size, overlap=overlap)
         if not chunks:
             continue
 
@@ -262,9 +272,28 @@ def ingest_files(file_paths: Iterable[Path], reset: bool = False) -> IngestResul
 
         # Chroma accepts a plain list of strings; avoid instantiating the typing alias.
         collection.add(documents=list(chunks), metadatas=metadatas, ids=ids)
+
+        # Record the document in the relational store for traceability/coverage.
+        try:
+            import db  # lazy import: keeps module import light
+
+            sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+            db.upsert_document(path.name, sha256)
+        except Exception as exc:
+            # Document bookkeeping should never break ingestion
+            print(f"[INGEST] failed to record document {path.name}: {exc}")
+
         docs_ingested += 1
         chunks_added += len(chunks)
         sources.append(path.name)
+
+    if top_k is not None:
+        try:
+            import db  # lazy import: keeps module import light
+
+            db.set_setting("top_k", str(max(1, int(top_k))))
+        except Exception as exc:
+            print(f"[INGEST] failed to persist top_k setting: {exc}")
 
     return IngestResult(
         docs_ingested=docs_ingested,

@@ -76,6 +76,12 @@ def run_test_case(test_case_id: int, script_code: Optional[str] = None, base_url
     return resp.json()
 
 
+def get_coverage():
+    resp = requests.get(f"{BACKEND_URL}/coverage", timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def get_run(run_id: int):
     resp = requests.get(f"{BACKEND_URL}/runs/{run_id}", timeout=30)
     resp.raise_for_status()
@@ -170,6 +176,7 @@ PAGES = {
     "kb": "Knowledge Base",
     "cases": "Test Cases",
     "scripts": "Selenium Scripts",
+    "coverage": "Coverage",
 }
 if "page" not in st.session_state:
     st.session_state["page"] = "kb"
@@ -437,6 +444,65 @@ elif page == "scripts":
                         st.write(ctx["text"])
             st.code(last_script, language="python")
         st.markdown('</div>', unsafe_allow_html=True)
+
+# --- Coverage / Traceability Page ---
+elif page == "coverage":
+    st.markdown("### 🧭 Coverage & Traceability")
+    st.markdown(
+        "Matrix of ingested documents vs. test cases. A cell is marked when the "
+        "test case's `grounded_in` citation references that document."
+    )
+    try:
+        coverage = get_coverage()
+    except Exception as exc:
+        st.error(f"Failed to load coverage: {exc}")
+    else:
+        docs = coverage.get("documents", [])
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Documents", coverage.get("total_documents", 0))
+        m2.metric("Covered", coverage.get("covered_documents", 0))
+        m3.metric("Uncovered", coverage.get("uncovered_documents", 0))
+
+        if not docs:
+            st.info("No documents ingested yet. Upload support docs in the Knowledge Base tab.")
+        else:
+            # Collect every covering test case across all documents for matrix columns
+            case_labels: dict = {}
+            case_meta: dict = {}
+            for d in docs:
+                for tc in d.get("test_cases", []):
+                    cid = tc.get("id")
+                    case_labels[cid] = f"#{cid}: {tc.get('scenario', '')}"
+                    case_meta[cid] = tc
+
+            # doc x test-case matrix
+            matrix = {}
+            for d in docs:
+                covered_ids = {tc.get("id") for tc in d.get("test_cases", [])}
+                matrix[d["filename"]] = {
+                    case_labels[cid]: ("✅" if cid in covered_ids else "")
+                    for cid in case_labels
+                }
+            if case_labels:
+                df = pd.DataFrame(matrix).T
+                df.insert(0, "status", ["covered" if d["status"] == "covered" else "uncovered" for d in docs])
+                st.dataframe(df, use_container_width=True)
+            else:
+                st.info("No test cases are grounded in any document yet. Generate test cases first.")
+                status_df = pd.DataFrame(
+                    [{"filename": d["filename"], "status": d["status"]} for d in docs]
+                )
+                st.dataframe(status_df, use_container_width=True, hide_index=True)
+
+            # Per-document detail: covering test cases
+            st.markdown("#### Covering test cases per document")
+            for d in docs:
+                badge = "✅ covered" if d["status"] == "covered" else "⬜ uncovered"
+                with st.expander(f"{d['filename']} — {badge} ({len(d.get('test_cases', []))} cases)"):
+                    st.caption(f"sha256: `{d.get('sha256', '')[:16]}…`")
+                    for tc in d.get("test_cases", []):
+                        st.markdown(f"**#{tc['id']}** {tc.get('feature', '')} — {tc.get('scenario', '')}")
+                        st.caption(f"grounded_in: {tc.get('grounded_in', '')}")
 
 # --- Footer ---
 st.markdown(
